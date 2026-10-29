@@ -1,0 +1,4 @@
+# Install the PyTorch wheel compatible with your JetPack/Python separately.
+# NumPy <2 avoids ABI incompatibilities with older NVIDIA PyTorch wheels.
+numpy>=1.19,<2
+netCDF4>=1.5,<2

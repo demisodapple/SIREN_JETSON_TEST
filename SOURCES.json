@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "upstream": {
+    "pd-bus-moderntcn-fpga": "cad6ac6a540183c24a8028b5f463a86b36e5c9b8",
+    "SIREN_MODEL3_COMP": "fd27899deb9d26391f3c0a680a483a8ca0a27c8b"
+  },
+  "models": {
+    "pd": {
+      "file": "weights/model1_PD_weight.pth",
+      "sha256": "f13da4ea9dcd5acf16561fa9b542e84bc4e5593af3de46ca9c020dc280c32183",
+      "source_checkpoint": "models/pd-kd_zt0k_d768_qat16/qat_checkpoint.pt",
+      "source_checkpoint_sha256": "5df38646d6aade032cd1540929bd213fd1a306c5f24027de96a7ce6eccc523ed",
+      "source_contract": "models/pd-kd_zt0k_d768_qat16/contract-pad-310/contract.json",
+      "source_contract_sha256": "41a90be0a03bec9a2dccf2cda6fc5be7052f1d8fd88b0fcf28f536e8e0635855"
+    },
+    "bus": {
+      "file": "weights/model2_BUS_weight.pth",
+      "sha256": "465acc71232b2bba7b3100257b86edf03c5d1734fcae2150353f3de6810d4533",
+      "source_checkpoint": "models/bus-ma8q-r15/qat-state.pt",
+      "source_checkpoint_sha256": "bbc7c4eaa83a9e5a2b5aeadbe0d54cad259149d2ff278f896c8e4c45a69900a3",
+      "source_contract": "models/bus-ma8q-r15/contract.json",
+      "source_contract_sha256": "1b44785834408c91d1a0d0265cb7dc92ee238d6675fd80c462dfb08b50e87626"
+    },
+    "comp": {
+      "file": "weights/model3_COMP_ModernTCN_weight.pth",
+      "sha256": "a77defe935d2de06443349f673a10db7709c27f0a70feb774b97ac1fd40e52ce",
+      "source_checkpoint": "models/comp-v9_t0_d768h1536/model.pt",
+      "source_checkpoint_sha256": "ffce7005aa9c19a3599814547732dbdf99bc1bf0b21f65696b026908dc2df4a7",
+      "source_contract": "models/comp-v9_t0_d768h1536/contract/contract.json",
+      "source_contract_sha256": "4e0f5568cb459b721eb85db33466e7a089c598c149530805d2bc6cc66323ea27"
+    },
+    "gru": {
+      "file": "weights/model3_COMP_GRU_weight.pth",
+      "sha256": "bfec4df6815bc8f2a5aa956a5a5cd180c1e329d8af23a61453a02ee67ebdf312",
+      "source_checkpoint": "model/best_model.pth",
+      "source_checkpoint_sha256": "915045689d5f115da21f948192a2913b03769e2e259420653d700bb8d0e578be",
+      "source_contract": null,
+      "source_contract_sha256": null
+    }
+  },
+  "adapted_code": {
+    "plugins/f-astra/f_astra/integer_contract.py": "daaa89b3743fbb1bb23658531b5c20b0107560717055162b3128a32ca49e2329",
+    "plugins/f-astra/f_astra/integer_torch.py": "b25d883bd7fd888bb0b85a48e8c3021a38343e059d08be3833cc6506ba59c84b",
+    "plugins/f-astra/f_astra/directrtl_pd_zt.py": "ebf7a2188db7f3f13075607392504103e17c9899187e9c1a53d05b64cfcc9300",
+    "src/codec.py": "8a05e50776e41a86b4f308a61712379483f5e950ddaa06a1ec9b7422462ed321",
+    "src/predictor.py": "a10d79313faa860bc3921dc24689a295b4dfce981e90cf561c0387c38f07963f",
+    "src/data.py": "9340d0092bc5782eb4d67e5bdc6c4a503e1c3a03b8814637e7f5d1b9e1e6bd03"
+  }
+}

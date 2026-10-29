@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+inputs/
+results/
+*.nc
+*.csv
+*.npz
+*.scbz2
+.DS_Store
