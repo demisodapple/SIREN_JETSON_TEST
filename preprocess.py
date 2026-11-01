@@ -506,6 +506,34 @@ def save_input(path, x, model, valid_rows, source, synthetic=False, **extra):
                  source=np.asarray(source),**extra)
 
 
+def dummy_input(model, frames=4, seed=20261102):
+    """Deterministic nonzero load; zero padding, no satellite observations or labels."""
+    need(isinstance(frames,int) and 1<=frames<=1024,'dummy frames must be between 1 and 1024')
+    need(isinstance(seed,int) and 0<=seed<2**32,'seed must fit uint32')
+    length,channels=model.input_shape
+    real_channels={'pd':28,'bus':12,'comp':19,'gru':34}[model.name]
+    qpos=model.contract['input_qpos'] if model.contract else 10
+    rng=np.random.RandomState(seed)
+    noise=rng.uniform(-.25,.25,(frames,length,real_channels))
+    phase=np.arange(length,dtype=np.float64)[None,:,None]*2*np.pi/max(length,2)
+    channel_phase=np.arange(real_channels,dtype=np.float64)[None,None,:]*.37
+    codes=np.floor((.6*np.sin(phase+channel_phase)+noise)*2.0**qpos+.5)
+    x=np.zeros((frames,length,channels),np.int16 if model.backend=='reference' else np.float32)
+    x[:,:,:real_channels]=codes if model.backend=='reference' else codes*2.0**(-qpos)
+    nominal_rows=1 if model.name=='gru' else (16 if model.name=='bus' else length-receptive_field(model.contract))
+    return x,np.full(frames,nominal_rows,np.int64),{
+        'generator':'bounded-wave-plus-uniform-noise-v1','seed':seed,'frames':frames,
+        'normalized_range':[-.85,.85],'grid_qpos':qpos,'zero_padding_channels':channels-real_channels,
+        'accuracy_validated':False,'meaning':'synthetic load; nominal rows are not real satellite samples'}
+
+
+def prepare_dummy(args,model):
+    x,valid,details=dummy_input(model,args.frames,args.seed)
+    save_input(args.output,x,model,valid,'bundled synthetic DNN load',True,
+               calibration_mode=np.asarray('synthetic_dummy'),
+               preparation_details=np.asarray(json.dumps(details)))
+
+
 def load_input(path, model):
     with np.load(str(path),allow_pickle=False) as d:
         need(str(d['model'])==model.name and str(d['backend'])==model.backend, 'input model/backend mismatch; prepare again')

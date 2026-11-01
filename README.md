@@ -2,6 +2,71 @@
 
 Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 측정 → GRU와 ModernTCN 압축 비교 → 전력 로그 결합**을 진행한다. 모든 명령은 `run.py`에서 실행한다.
 
+**원자료 없이 세 DNN 실행과 OPS 측정하기**
+
+`dummy_data/`에 PD·BUS·압축용 ModernTCN 입력을 포함했다. 원자료 다운로드나 전처리 없이 바로 실행한다. 임무는 세 개이며 GRU는 3번 임무의 추가 비교용이다. 기본 `trial`의 세 모델은 PD + BUS + ModernTCN이다.
+
+| 파일 이름 (`dummy_data/` 안) | 형식 | 모양 |
+|---|---|---|
+| `model1_PD_float.npz` | FP32 이식 경로 입력 | `[4,310,28]` |
+| `model2_BUS_float.npz` | FP32 이식 경로 입력 | `[4,64,12]` |
+| `model3_COMP_ModernTCN_float.npz` | FP32 이식 경로 입력 | `[4,310,24]`, 마지막 5채널 0 |
+| `model1_PD_reference.npz` | 정수 참조 경로 입력 | `[4,310,32]`, 마지막 4채널 0 |
+| `model2_BUS_reference.npz` | 정수 참조 경로 입력 | `[4,64,12]` |
+| `model3_COMP_ModernTCN_reference.npz` | 정수 참조 경로 입력 | `[4,310,24]` |
+| `model3_COMP_GRU_float.npz` | 비교용 GRU 입력 | `[4,1,34]` |
+
+배열은 NumPy NPZ이며 `x`와 모델·가중치 해시·생성 조건이 들어 있다. seed=20261102, 창당 0.6×사인파와 [-0.25,0.25] 균등 잡음을 합친 입력이며 실제 위성 자료가 아니다. FP32/정수 입력은 같은 격자를 사용한다. 파일 SHA-256과 프레임당 연산량은 `dummy_data/manifest.json`에 있다. 결과에는 `synthetic: true`, `calibration_mode: synthetic_dummy`가 남는다.
+
+Jetson SSH 터미널에서 먼저 환경을 확인한다. 기존 설치 패키지는 이 단계에서 재설치하지 않는다.
+
+```bash
+cd ~/SIREN_JETSON_TEST
+git pull
+python3 -c "import torch, numpy; print('PyTorch:',torch.__version__); print('NumPy:',numpy.__version__); print('CUDA:',torch.cuda.is_available())"
+```
+
+CPU에서 세 모델을 각각 짧게 실행:
+
+```bash
+python3 run.py trial --device cpu --phase single --duration 1 --repeat 1 --warmup 1 --output results/dummy_check01
+```
+
+이후 CUDA가 True인 호환 NVIDIA PyTorch 환경에서 GPU 측정:
+
+```bash
+python3 run.py trial --device cuda --phase all --duration 60 --repeat 3 --output results/dummy_gpu01
+```
+
+각 모델을 60초 이상씩 3회 측정하고, 세 모델 동시 실행을 60초 이상씩 3회 측정한다. 순차 9분 + 동시 3분 = 최소 약 12분에 로딩·예비 실행 시간이 더해진다. 작업 1회 시간이 설정 구간보다 길면 완료까지 기다린다. `--phase single` 또는 `--phase together`로 각 단계를 별도 실행할 수 있다. 다른 시험에는 새 결과 폴더 이름을 사용한다. 실행할 때마다 작업 프로세스와 로그를 만들며 실패 시 다음 단계로 넘어가지 않는다. CPU 스레드는 프로세스당 기본 1개다.
+
+`trial` 기본 backend는 **FP32 이식 경로(float)**다. `--backend reference`는 공개 정수 계산을 INT64/FP64로 재현하는 검증 경로이며 네이티브 INT8 GPU 성능이 아니다. 두 결과를 같은 실행 방식으로 혼동하지 않는다. 실제 Nano GPU 호환성·속도는 보드에서 확인해야 한다. CPU 검증 통과를 Nano 실측 성공으로 표시하지 않는다.
+
+| 결과 | 내용 |
+|---|---|
+| `pd.json`, `bus.json`, `comp.json` | 단독 실행의 MACs·operations/프레임, 연산/초, GOPS, 지연, 입력 해시와 측정 시각 |
+| `together_01/pd.json` 등 | 동시 실행할 때 각 DNN의 지연·처리량 |
+| `together_01/system.json` | 세 DNN이 모두 실행된 공통 시간 구간. 전력 로그를 이 구간에 연결 |
+| `summary.json` | 생성된 결과 파일 및 측정 구간 요약 |
+| 모델별 `.log` | 로딩·예비 실행·실행 실패 등 확인 |
+
+측정은 준비된 입력 → 신경망 출력까지이며 학습·원자료 전처리·잔차 생성·BZ2 압축은 포함하지 않는다. 모델 로딩과 예비 실행도 제외한다. 기본 연산량은 **행렬·합성곱 1 MAC=2 operations** 기준이다. LayerNorm·GELU·잔차 덧셈 등 누락 항목을 결과에 명시하고, 지연은 신경망 전체 호출을 측정한다. 동시 GPU 실행에서는 작업 간 경합과 동기화 대기도 시간에 포함된다.
+
+전력은 외부 측정기 기록을 먼저 시작하고 위 명령을 실행한다. `--tegrastats`를 추가하면 상태 로그도 저장하지만 외부 보드 입력 전력 기록을 대체하지 않는다. 계측기의 모델별 취득 드라이버는 현재 연결하지 않았다. 외부 CSV는 `time_s`(Jetson과 같은 Unix epoch 초), `power_w`(보드 입력 W) 열이 필요하다.
+
+```bash
+python3 run.py power --input inputs/power.csv --result results/dummy_gpu01/pd.json --output results/dummy_gpu01/pd_power.json
+python3 run.py power --input inputs/power.csv --result results/dummy_gpu01/together_01/system.json --output results/dummy_gpu01/together_01/system_power.json
+```
+
+평균 W, 관측 최대 W, 에너지 J와 실제 표본 간격을 계산한다. 100 Hz는 10 ms 간격에서 **관측된 최대 전력**이며 모든 순간 피크를 포착한다는 의미가 아니다. 전체 장치·모델 조합에서 가능한 절대 최대 전력도 보장하지 않는다. 개별 모델 최대 전력을 합산해서 동시 실행 피크로 쓰지 않는다. 정식 데이터의 정확도·운용 전력은 별도 검증 대상이다.
+
+새 더미 입력을 만들려면 기존 prepare 명령을 사용한다.
+
+```bash
+python3 run.py prepare --kind dummy --model pd --backend float --frames 4 --seed 20261102 --output inputs/another_dummy.npz
+```
+
 **임의 통계·보정값으로 바로 DNN 부하·전력 측정하기**
 
 `demo_calibration.json`을 함께 제공한다. 아래 명령에서 `--demo-calibration demo_calibration.json`을 명시하면 외부 학습 통계·배경표 없이 실제 원자료에서 입력을 만든다. 신경망 가중치는 기존 것을 그대로 사용한다. 준비 단계는 측정 전에 수행하며 DNN 측정 시간에 포함되지 않는다.

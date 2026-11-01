@@ -6,5 +6,6 @@ results/
 *.nc
 *.csv
 *.npz
+!dummy_data/*.npz
 *.scbz2
 .DS_Store

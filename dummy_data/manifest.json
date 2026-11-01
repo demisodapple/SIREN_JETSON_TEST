@@ -1,0 +1,128 @@
+{
+  "schema": 1,
+  "synthetic": true,
+  "purpose": "DNN inference and load/OPS tests only",
+  "seed": 20261102,
+  "frames_per_file": 4,
+  "inputs": {
+    "pd_float": {
+      "file": "dummy_data/model1_PD_float.npz",
+      "sha256": "c2f4e748cf6a40c3f6f15c60d3cd5a64b936cab039116ae0591fe0cfa48c13fd",
+      "weight_sha256": "f13da4ea9dcd5acf16561fa9b542e84bc4e5593af3de46ca9c020dc280c32183",
+      "shape": [
+        4,
+        310,
+        28
+      ],
+      "backend": "float",
+      "operations": {
+        "macs_per_frame": 3768925440,
+        "operations_per_frame": 7537850880,
+        "convention": "1 MAC = 2 operations; matrix/conv only",
+        "excluded": "bias, residual add, LayerNorm, GELU, preprocessing"
+      }
+    },
+    "bus_float": {
+      "file": "dummy_data/model2_BUS_float.npz",
+      "sha256": "95febd71b30c23f3401975e667aa7d1df1d467d978b04b76e43d15bc1acd9d40",
+      "weight_sha256": "465acc71232b2bba7b3100257b86edf03c5d1734fcae2150353f3de6810d4533",
+      "shape": [
+        4,
+        64,
+        12
+      ],
+      "backend": "float",
+      "operations": {
+        "macs_per_frame": 856148,
+        "operations_per_frame": 1712296,
+        "convention": "1 MAC = 2 operations; matrix/conv only",
+        "excluded": "bias, residual add, LayerNorm, GELU, preprocessing"
+      }
+    },
+    "comp_float": {
+      "file": "dummy_data/model3_COMP_ModernTCN_float.npz",
+      "sha256": "be0f38f64f50b7b3f82e53edb0afa3bc378a021f45da8fff352a61b0fcbd5a0a",
+      "weight_sha256": "a77defe935d2de06443349f673a10db7709c27f0a70feb774b97ac1fd40e52ce",
+      "shape": [
+        4,
+        310,
+        24
+      ],
+      "backend": "float",
+      "operations": {
+        "macs_per_frame": 2306638080,
+        "operations_per_frame": 4613276160,
+        "convention": "1 MAC = 2 operations; matrix/conv only",
+        "excluded": "bias, residual add, LayerNorm, GELU, preprocessing"
+      }
+    },
+    "pd_reference": {
+      "file": "dummy_data/model1_PD_reference.npz",
+      "sha256": "6ed2b66196a042d629918f620e59f081a9e7ba199a1950267b54d686edaf949d",
+      "weight_sha256": "f13da4ea9dcd5acf16561fa9b542e84bc4e5593af3de46ca9c020dc280c32183",
+      "shape": [
+        4,
+        310,
+        32
+      ],
+      "backend": "reference",
+      "operations": {
+        "macs_per_frame": 3767735040,
+        "operations_per_frame": 7535470080,
+        "convention": "1 MAC = 2 operations; matrix/conv only",
+        "excluded": "bias, residual add, LayerNorm, GELU, requantization, emulation overhead"
+      }
+    },
+    "bus_reference": {
+      "file": "dummy_data/model2_BUS_reference.npz",
+      "sha256": "e363c84e94ee45c10664b975a055004c659d5141f906a60f85a4077d386668c7",
+      "weight_sha256": "465acc71232b2bba7b3100257b86edf03c5d1734fcae2150353f3de6810d4533",
+      "shape": [
+        4,
+        64,
+        12
+      ],
+      "backend": "reference",
+      "operations": {
+        "macs_per_frame": 856148,
+        "operations_per_frame": 1712296,
+        "convention": "1 MAC = 2 operations; matrix/conv only",
+        "excluded": "bias, residual add, LayerNorm, GELU, requantization, emulation overhead"
+      }
+    },
+    "comp_reference": {
+      "file": "dummy_data/model3_COMP_ModernTCN_reference.npz",
+      "sha256": "e420c67a12464f2d2e2c57a8bfdf775566cb7ed6ffb7baeebc688a234266ccfa",
+      "weight_sha256": "a77defe935d2de06443349f673a10db7709c27f0a70feb774b97ac1fd40e52ce",
+      "shape": [
+        4,
+        310,
+        24
+      ],
+      "backend": "reference",
+      "operations": {
+        "macs_per_frame": 2304495360,
+        "operations_per_frame": 4608990720,
+        "convention": "1 MAC = 2 operations; matrix/conv only",
+        "excluded": "bias, residual add, LayerNorm, GELU, requantization, emulation overhead"
+      }
+    },
+    "gru_float": {
+      "file": "dummy_data/model3_COMP_GRU_float.npz",
+      "sha256": "d184be4c8797c7633b8010732bab7adf53f93fe6689a90fe28294fa6f381fcc7",
+      "weight_sha256": "bfec4df6815bc8f2a5aa956a5a5cd180c1e329d8af23a61453a02ee67ebdf312",
+      "shape": [
+        4,
+        1,
+        34
+      ],
+      "backend": "float",
+      "operations": {
+        "macs_per_frame": 20608,
+        "operations_per_frame": 41216,
+        "convention": "1 MAC = 2 operations; matrix/conv only",
+        "excluded": "bias, sigmoid/tanh, gate elementwise products, preprocessing"
+      }
+    }
+  }
+}

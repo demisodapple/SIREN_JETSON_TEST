@@ -79,6 +79,8 @@ def prepare(args):
         dtype=np.int16 if m.backend=='reference' else np.float32
         x=np.zeros([1]+m.input_shape,dtype)
         pp.save_input(args.output,x,m,[1 if m.name=='gru' else m.input_shape[0]],'synthetic zero smoke input',True)
+    elif args.kind=='dummy':
+        pp.prepare_dummy(args,m)
     elif args.kind=='counts':
         if m.name not in ('gru','comp'):
             raise ValueError('counts preparation requires gru or comp')
@@ -155,6 +157,8 @@ def benchmark(args):
     x,meta,expected=load_input(args.input,m)
     if meta['calibration_mode']=='arbitrary_demo':
         print('DEMO CALIBRATION: DNN load/power experiment only; detection accuracy is unvalidated.',flush=True)
+    if meta['synthetic']:
+        print('SYNTHETIC INPUT: DNN load/OPS experiment; task accuracy and representative mission power unvalidated.',flush=True)
     ops=m.operations()
     # Validate supplied reference outside measurement, preserving sequential GRU states.
     validation={'expected_provided':expected is not None,'passed':None}
@@ -200,7 +204,9 @@ def benchmark(args):
                     'wall_seconds':end-begin,'inference_seconds':measured,'frames':frames,'valid_rows':rows,
                     'mean_latency_ms':mean*1000,'min_latency_ms':lo*1000,'max_latency_ms':hi*1000,
                     'latency_std_ms':(m2/frames)**.5*1000,'frames_per_second':frames/measured,
-                    'valid_rows_per_second':rows/measured,'gops':ops['operations_per_frame']*frames/measured/1e9}
+                    'valid_rows_per_second':rows/measured,
+                    'operations_per_second':ops['operations_per_frame']*frames/measured,
+                    'gops':ops['operations_per_frame']*frames/measured/1e9}
             result['runs'].append(record)
             print(json.dumps(record),flush=True)
     if m.device.type=='cuda': result['cuda_memory_peak_bytes']=torch.cuda.max_memory_allocated()
@@ -348,6 +354,7 @@ def together(args):
                    'scope':'intersection of three DNN workloads; no codec, no mission scheduling',
                    'device':args.device,'threads_per_worker':args.threads,
                    'calibration_modes':{r['model']:r['input']['calibration_mode'] for r in results},
+                   'synthetic_inputs':{r['model']:r['input']['synthetic'] for r in results},
                    'results':[n+'.json' for n,_ in assignments]})
         print('Completed '+str(folder))
     finally:
@@ -357,6 +364,68 @@ def together(args):
                 try: p.wait(timeout=5)
                 except subprocess.TimeoutExpired: p.kill(); p.wait()
         for log in logs: log.close()
+
+
+def trial(args):
+    """Bundled dummy DNNs: separate processes, then three concurrent workloads."""
+    if args.duration<=0 or args.repeat<1 or args.warmup<0 or args.threads<1:
+        raise ValueError('duration/repeat/threads must be positive; warmup nonnegative')
+    import torch
+    if args.device=='cuda' and not torch.cuda.is_available():
+        raise ValueError('CUDA unavailable; check NVIDIA PyTorch or use --device cpu')
+    folder=Path(args.output).resolve()
+    folder.mkdir(parents=True,exist_ok=False)
+    manifest=json.loads((ROOT/'dummy_data'/'manifest.json').read_text(encoding='utf-8'))
+    inputs={n:ROOT/manifest['inputs'][n+'_'+args.backend]['file'] for n in ('pd','bus','comp')}
+    from models import file_sha
+    for name,path in inputs.items():
+        if file_sha(path)!=manifest['inputs'][name+'_'+args.backend]['sha256']:
+            raise ValueError('bundled dummy input hash mismatch: '+str(path))
+    common=['--backend',args.backend,'--device',args.device,'--threads',str(args.threads),
+            '--duration',str(args.duration),'--warmup',str(args.warmup)]
+    outputs=[]
+    write_json(folder/'trial_config.json',{'models':['pd','bus','comp'],'synthetic':True,'backend':args.backend,
+        'device':args.device,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
+        'scope':'DNN only; preprocessing, compression and model loading excluded',
+        'power_note':'external board power CSV required; tegrastats is health telemetry'})
+    def child(extra,logname):
+        with open(str(folder/logname),'x',encoding='utf-8') as log:
+            print('Running: '+' '.join(extra),flush=True)
+            p=subprocess.Popen([sys.executable,'-u',str(ROOT/'run.py')]+extra,stdout=log,stderr=subprocess.STDOUT)
+            try:
+                status=p.wait()
+            finally:
+                if p.poll() is None:
+                    p.terminate()
+                    try: p.wait(timeout=5)
+                    except subprocess.TimeoutExpired: p.kill(); p.wait()
+            if status!=0:
+                raise RuntimeError('trial worker failed; see '+str(folder/logname))
+    if args.phase in ('single','all'):
+        for name in ('pd','bus','comp'):
+            output=folder/(name+'.json')
+            extra=['bench','--model',name,'--input',str(inputs[name]),'--output',str(output),
+                   '--repeat',str(args.repeat)]+common
+            if args.tegrastats: extra+=['--tegrastats',str(folder/(name+'_health.txt'))]
+            child(extra,name+'.log'); outputs.append(output)
+    if args.phase in ('together','all'):
+        for repeat in range(args.repeat):
+            output=folder/('together_%02d'%(repeat+1))
+            extra=['together','--pd-input',str(inputs['pd']),'--bus-input',str(inputs['bus']),
+                   '--comp-input',str(inputs['comp']),'--output',str(output),
+                   '--startup-timeout',str(args.startup_timeout)]+common
+            if args.tegrastats: extra+=['--tegrastats']
+            child(extra,'together_%02d.log'%(repeat+1)); outputs.append(output/'system.json')
+    summary=[]
+    for path in outputs:
+        data=json.loads(path.read_text(encoding='utf-8'))
+        summary.append({'file':str(path.relative_to(folder)),'kind':data['kind'],
+                        'model':data.get('model'),'backend':args.backend,
+                        'runs':data.get('runs'),'start_unix_s':data.get('start_unix_s'),
+                        'end_unix_s':data.get('end_unix_s')})
+    write_json(folder/'summary.json',{'synthetic':True,'measurements':summary,
+        'note':'attach power to each model JSON or together_NN/system.json; never sum individual power peaks'})
+    print('Completed dummy DNN trial: '+str(folder),flush=True)
 
 
 def parser():
@@ -371,9 +440,11 @@ def parser():
     c=sub.add_parser('ops',parents=[common]); c.set_defaults(func=operations_command)
     c.add_argument('--output',required=True)
     c=sub.add_parser('prepare',parents=[common]); c.set_defaults(func=prepare)
-    c.add_argument('--kind',choices=['smoke','tensor','counts','bus','pd'],required=True)
+    c.add_argument('--kind',choices=['smoke','dummy','tensor','counts','bus','pd'],required=True)
     c.add_argument('--input'); c.add_argument('--output',required=True)
     c.add_argument('--dtype'); c.add_argument('--valid-rows',type=int); c.add_argument('--expected')
+    c.add_argument('--frames',type=int,default=4,help='synthetic frames for --kind dummy')
+    c.add_argument('--seed',type=int,default=20261102,help='deterministic dummy seed')
     c.add_argument('--stats'); c.add_argument('--time-column',default='time_s')
     c.add_argument('--demo-calibration',help='explicit arbitrary demo JSON for PD/BUS load tests')
     c.add_argument('--bus-channel',help='select EIRSAT Channel; demo defaults to 15 when column exists')
@@ -403,13 +474,21 @@ def parser():
     c.add_argument('--input',required=True,help='external power CSV, Unix epoch time_s and power_w')
     c.add_argument('--result',required=True); c.add_argument('--output',required=True)
     c.add_argument('--max-gap',type=float,default=.05)
+    c=sub.add_parser('trial'); c.set_defaults(func=trial)
+    c.add_argument('--backend',choices=['reference','float'],default='float')
+    c.add_argument('--device',choices=['cpu','cuda'],default='cpu')
+    c.add_argument('--phase',choices=['single','together','all'],default='all')
+    c.add_argument('--duration',type=float,default=60); c.add_argument('--repeat',type=int,default=3)
+    c.add_argument('--warmup',type=int,default=3); c.add_argument('--threads',type=int,default=1)
+    c.add_argument('--startup-timeout',type=float,default=600)
+    c.add_argument('--tegrastats',action='store_true'); c.add_argument('--output',required=True)
     return p
 
 
 if __name__=='__main__':
     args=parser().parse_args()
     try:
-        if hasattr(args,'output') and args.command!='together' and Path(args.output).exists():
+        if hasattr(args,'output') and args.command not in ('together','trial') and Path(args.output).exists():
             raise ValueError('output exists; choose a new name: '+args.output)
         args.func(args)
     except (ValueError,RuntimeError,OSError,ImportError,KeyError) as exc:

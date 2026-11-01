@@ -141,6 +141,43 @@ class TestCompression(unittest.TestCase):
 
 
 class TestPreparationAndPower(unittest.TestCase):
+    def test_dummy_bounds_padding_reproducibility_and_identity(self):
+        for name in ('pd','bus','comp','gru'):
+            with self.subTest(model=name):
+                m=models.Model(name,backend='float')
+                x,valid,details=prep.dummy_input(m)
+                again,_,_=prep.dummy_input(m)
+                np.testing.assert_array_equal(x,again)
+                self.assertEqual(x.shape[0],4)
+                self.assertGreater(np.count_nonzero(x),0)
+                self.assertLessEqual(float(np.abs(x).max()),.9)
+                different,_,_=prep.dummy_input(m,seed=1)
+                self.assertFalse(np.array_equal(x,different))
+                if name=='comp': self.assertTrue(np.all(x[:,:,19:]==0))
+                if name!='gru':
+                    r=models.Model(name,backend='reference')
+                    codes,rv,rd=prep.dummy_input(r)
+                    np.testing.assert_array_equal(valid,rv)
+                    np.testing.assert_array_equal(x,codes[:,:,:x.shape[-1]]*2.0**(-rd['grid_qpos']))
+                    if name=='pd': self.assertTrue(np.all(codes[:,:,28:]==0))
+                with self.assertRaises(ValueError): prep.dummy_input(m,frames=0)
+                with self.assertRaises(ValueError): prep.dummy_input(m,seed=-1)
+
+    def test_bundled_dummy_inputs_hashes_and_metadata(self):
+        root=Path(__file__).parent
+        manifest=json.loads((root/'dummy_data/manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual(len(manifest['inputs']),7)
+        for key,entry in manifest['inputs'].items():
+            path=root/entry['file']; self.assertEqual(models.file_sha(path),entry['sha256'])
+            name,backend=key.split('_')
+            m=models.Model(name,backend=backend)
+            tensor,meta,expected=prep.load_input(path,m)
+            self.assertEqual(list(tensor.shape),entry['shape'])
+            self.assertTrue(meta['synthetic'])
+            self.assertEqual(meta['calibration_mode'],'synthetic_dummy')
+            self.assertIsNone(expected)
+            self.assertEqual(entry['operations'],m.operations())
+
     def test_explicit_demo_calibration_and_result_metadata(self):
         with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
             root=Path(temp); profile=Path(__file__).parent/'demo_calibration.json'
