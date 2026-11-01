@@ -141,6 +141,68 @@ class TestCompression(unittest.TestCase):
 
 
 class TestPreparationAndPower(unittest.TestCase):
+    def test_explicit_demo_calibration_and_result_metadata(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp); profile=Path(__file__).parent/'demo_calibration.json'
+            p=models.Model('pd'); day='20220101'
+            summary=np.ones((288,36),np.float32)
+            summary[:,prep._C['n_valid']]=150; summary[:,prep._C['ifc']]=0
+            np.save(str(root/'summary.npy'),summary)
+            args=SimpleNamespace(input=str(root/'summary.npy'),output=str(root/'pd.npz'),date=day,
+                    demo_calibration=str(profile),tables=None,state=None,context=None,records=None,geo=None,sun=None)
+            prep.prepare_pd(args,p)
+            x,meta,expected=prep.load_input(args.output,p)
+            self.assertEqual(tuple(x.shape),(2,310,32))
+            self.assertEqual(meta['calibration_mode'],'arbitrary_demo')
+            self.assertFalse(meta['preparation_details']['accuracy_validated'])
+            self.assertFalse(meta['synthetic'])  # raw/supplied observations, arbitrary calibration
+            self.assertIsNone(expected)
+            self.assertEqual(len(meta['calibration_sha256']),64)
+            args.tables='real.bin'
+            with self.assertRaises(ValueError): prep.prepare_pd(args,p)
+
+    def test_demo_bus_channel_filter_and_iso_time(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp); profile=Path(__file__).parent/'demo_calibration.json'
+            bus_profile=prep.read_demo_calibration(profile)['bus']
+            names=bus_profile['channels']
+            path=root/'raw.csv'
+            with path.open('w',newline='') as f:
+                w=csv.writer(f); w.writerow(['OBT','Channel']+names)
+                for i in range(80):
+                    w.writerow([i*50,15]+bus_profile['std'])
+                    w.writerow([i*50,16]+[999]*12)
+            args=SimpleNamespace(input=str(path),output=str(root/'bus.npz'),stats=None,
+                                 time_column='auto',demo_calibration=str(profile),bus_channel=None)
+            m=models.Model('bus'); prep.prepare_bus(args,m)
+            x,meta,_=prep.load_input(args.output,m)
+            self.assertTrue(bool((x==16).all()))
+            self.assertEqual(meta['preparation_details']['bus_channel'],'15')
+            self.assertEqual(meta['calibration_mode'],'arbitrary_demo')
+            self.assertEqual(prep.time_seconds('2022-01-01T00:00:00Z'),1640995200.)
+
+    def test_demo_netcdf_noaa_time_metadata_and_missing_geometry(self):
+        try:
+            from netCDF4 import Dataset
+        except ImportError:
+            self.skipTest('install requirements.txt to test netCDF adapter')
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            path=Path(temp)/'l1b.nc'
+            with Dataset(str(path),'w') as ds:
+                ds.createDimension('time',150)
+                t=ds.createVariable('time','u8',('time',))
+                t.units='time'; t.long_name='milliseconds since 1970'; t.valid_range=np.asarray([0,0],np.uint64)
+                t[:]=1640995200000+np.arange(150)*2000
+                for name in (['mep_pro_tel0_flux_p%d'%i for i in range(1,7)]+
+                             ['mep_ele_tel0_flux_e%d'%i for i in range(1,4)]):
+                    ds.createVariable(name,'f4',('time',))[:]=3
+            profile=prep.read_demo_calibration(Path(__file__).parent/'demo_calibration.json')['pd']
+            summary,date,details=prep.l1b_demo_summary(path,profile)
+            self.assertEqual(date,'20220101')
+            self.assertEqual(summary[0,0],3)
+            self.assertEqual(summary[0,prep._C['n_valid']],150)
+            self.assertIn('abs_mlat',details['placeholder_geometry'])
+
     def test_counts_preparation_and_bus_statistics(self):
         with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
             root=Path(temp)

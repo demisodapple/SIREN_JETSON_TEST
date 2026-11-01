@@ -514,9 +514,14 @@ def load_input(path, model):
         synthetic = bool(d['synthetic'])
         source = str(d['source'])
         expected = d['expected'] if 'expected' in d else None
+        calibration_mode = str(d['calibration_mode']) if 'calibration_mode' in d else 'provided_or_checkpoint'
+        calibration_sha = str(d['calibration_sha256']) if 'calibration_sha256' in d else None
+        details = json.loads(str(d['preparation_details'])) if 'preparation_details' in d else None
     need(len(x)>0 and valid.shape==(len(x),) and valid.dtype.kind in 'iu' and np.all(valid>0)
          and np.all(valid<=x.shape[1]), 'invalid input metadata')
-    return model.tensor(x), {'synthetic':synthetic,'source':source,'valid_rows':valid.tolist()}, expected
+    return model.tensor(x), {'synthetic':synthetic,'source':source,'valid_rows':valid.tolist(),
+                            'calibration_mode':calibration_mode,'calibration_sha256':calibration_sha,
+                            'preparation_details':details}, expected
 
 
 def prepare_counts(args, model):
@@ -534,16 +539,36 @@ def prepare_counts(args, model):
 
 
 def prepare_bus(args, model):
-    need(args.stats is not None, 'BUS requires training statistics NPZ: channels, mean, std. Not bundled upstream.')
-    with np.load(args.stats,allow_pickle=False) as s:
-        names=s['channels'].tolist(); mean=s['mean']; std=s['std']
+    demo=getattr(args,'demo_calibration',None)
+    if demo:
+        need(args.stats is None, 'choose either --stats or --demo-calibration')
+        profile=read_demo_calibration(demo)['bus']
+        names=profile['channels']; mean=np.asarray(profile['mean']); std=np.asarray(profile['std'])
+    else:
+        need(args.stats is not None, 'BUS requires training statistics NPZ, or explicit --demo-calibration')
+        with np.load(args.stats,allow_pickle=False) as s:
+            names=s['channels'].tolist(); mean=s['mean']; std=s['std']
     need(len(names)==12 and len(set(names))==12 and mean.shape==std.shape==(12,)
          and np.all(np.isfinite(mean)) and np.all(np.isfinite(std)) and np.all(std>0), 'invalid BUS statistics')
     with open(args.input,encoding='utf-8-sig',newline='') as f:
         reader=csv.DictReader(f)
-        need(args.time_column in reader.fieldnames and all(n in reader.fieldnames for n in names), 'CSV columns missing')
-        records=list(reader)
-    times=np.asarray([float(r[args.time_column]) for r in records],np.float64)
+        time_column=args.time_column
+        if time_column=='auto':
+            candidates=[c for c in reader.fieldnames if c.lower() in ('time','time_s','timestamp','datetime','date','obt','epoch')]
+            need(len(candidates)==1, 'ambiguous time column; specify --time-column. CSV columns: '+str(reader.fieldnames))
+            time_column=candidates[0]
+        need(time_column in reader.fieldnames and all(n in reader.fieldnames for n in names),
+             'CSV columns missing; check --time-column and required 12 channels. Actual columns: '+str(reader.fieldnames))
+        bus_channel=getattr(args,'bus_channel',None)
+        if bus_channel is None and demo and 'Channel' in reader.fieldnames:
+            bus_channel='15'
+        need(bus_channel is None or 'Channel' in reader.fieldnames,'--bus-channel needs Channel column')
+        records=[{k:r[k] for k in [time_column]+names} for r in reader
+                 if bus_channel is None or r['Channel'].strip()==str(bus_channel)]
+    times=np.asarray([time_seconds(r[time_column]) for r in records],np.float64)
+    # Public EIRSAT CSV can have reverse ordering. Sort stably; duplicates still fail.
+    if demo:
+        order=np.argsort(times,kind='stable'); times=times[order]; records=[records[i] for i in order]
     need(len(times)>=2 and np.all(np.isfinite(times)) and np.all(np.diff(times)>0), 'time column must be increasing seconds')
     grid=np.arange(times[0],times[-1]+1e-8,50.0)
     columns=[]
@@ -555,14 +580,22 @@ def prepare_bus(args, model):
     rows=(np.stack(columns,axis=1)-mean)/std
     need(len(rows)>=64, 'BUS requires at least 64 resampled rows')
     x=np.stack([rows[i:i+64] for i in range(0,len(rows)-63,16)])
+    saturation_fraction=0.0
     if model.backend=='reference':
         low,high=ic_range(model.contract['input_bits'])
+        codes=np.floor(x*2.0**model.contract['input_qpos']+.5)
+        saturation_fraction=float(np.mean((codes<low)|(codes>high)))
         x=np.clip(np.floor(x*2.0**model.contract['input_qpos']+.5),low,high).astype(np.int16)
     else:
         x=x.astype(np.float32)
     save_input(args.output,x,model,np.full(len(x),16),str(args.input),
                preprocessing=np.asarray('50s linear interpolation; origin first timestamp; requires reference-output validation'),
-               stats_sha256=np.asarray(hashlib.sha256(Path(args.stats).read_bytes()).hexdigest()))
+               stats_sha256=np.asarray(hashlib.sha256(Path(demo or args.stats).read_bytes()).hexdigest()),
+               calibration_mode=np.asarray('arbitrary_demo' if demo else 'provided_training_stats'),
+               calibration_sha256=np.asarray(hashlib.sha256(Path(demo or args.stats).read_bytes()).hexdigest()),
+               preparation_details=np.asarray(json.dumps({'saturation_fraction':saturation_fraction,'time_column':time_column,
+                  'bus_channel':bus_channel,'accuracy_validated':False,
+                  'note':'real telemetry with arbitrary statistics' if demo else 'supplied statistics'})))
 
 
 def ic_range(bits):
@@ -570,6 +603,8 @@ def ic_range(bits):
 
 
 def prepare_pd(args, model):
+    if getattr(args,'demo_calibration',None):
+        return prepare_pd_demo(args,model)
     need(args.tables is not None, 'PD requires mentor ASTRAZT1 tables (eps, cols, mu, sd, yearly scales)')
     need(args.state is not None, 'PD requires previous-day history NPZ; do not silently replace by an empty state')
     need(args.date is not None, 'PD requires --date YYYYMMDD')
@@ -611,3 +646,135 @@ def prepare_pd(args, model):
                tables_sha256=np.asarray(hashlib.sha256(Path(args.tables).read_bytes()).hexdigest()),
                day_codes=current_codes)
     np.savez(str(state_path),days=np.asarray(sorted(new_state)),medians=np.stack([new_state[d] for d in sorted(new_state)]))
+
+
+def read_demo_calibration(path):
+    d=json.loads(Path(path).read_text(encoding='utf-8'))
+    need(d.get('schema')=='siren-demo-calibration-v1','wrong demo calibration schema')
+    return d
+
+
+def time_seconds(value):
+    """Numeric seconds or explicit UTC/ISO timestamp; no numeric milliseconds guessing."""
+    import datetime
+    s=str(value).strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    s=s.replace('T',' ')
+    if s.endswith('Z'): s=s[:-1]+'+0000'
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f%z','%Y-%m-%d %H:%M:%S%z',
+                '%Y-%m-%d %H:%M:%S.%f','%Y-%m-%d %H:%M:%S'):
+        try:
+            dt=datetime.datetime.strptime(s,fmt)
+            if dt.tzinfo is None: dt=dt.replace(tzinfo=datetime.timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            pass
+    raise ValueError('time must be numeric seconds or ISO UTC timestamp: '+s)
+
+
+def l1b_demo_summary(path,profile,date=None):
+    """Real 0-degree flux means; missing geometry/quality gets explicitly recorded placeholders.
+
+    This is a load-generation adapter, not a calibrated satellite hazard pipeline.
+    """
+    from netCDF4 import Dataset, num2date
+    required=(['mep_pro_tel0_flux_p%d'%i for i in range(1,7)]+
+              ['mep_ele_tel0_flux_e%d'%i for i in range(1,4)])
+    missing=[]; used={}
+    with Dataset(str(path),'r') as ds:
+        need(all(n in ds.variables for n in required),'PD demo needs L1b flux variables: '+', '.join(required))
+        need('time' in ds.variables,'L1b time variable required')
+        tv=ds['time']; need(hasattr(tv,'units'),'time.units required; refusing to guess seconds/milliseconds')
+        units=tv.units
+        if units=='time' and str(getattr(tv,'long_name','')).lower()=='milliseconds since 1970':
+            # NOAA file explicitly declares units in long_name; valid_range=[0,0] would mask every timestamp.
+            units='milliseconds since 1970-01-01 00:00:00'
+        need('since' in units,'unsupported time units: '+str(units))
+        tv.set_auto_mask(False)
+        times=num2date(tv[:],units,calendar=getattr(tv,'calendar','standard'))
+        day_strings=np.asarray(['%04d%02d%02d'%(t.year,t.month,t.day) for t in times])
+        if date is None:
+            unique,counts=np.unique(day_strings,return_counts=True); date=str(unique[np.argmax(counts)])
+        selected=day_strings==date
+        need(np.any(selected),'requested UTC date has no samples')
+        bins=np.asarray([(t.hour*3600+t.minute*60+t.second)//300 for t in times],np.int64)
+        summary=np.full((288,len(SUMMARY_COLUMNS)),np.nan,np.float32)
+        columns=[]
+        for name in required:
+            a=np.ma.asarray(ds[name][:],dtype=np.float64).filled(np.nan).reshape(-1)
+            need(len(a)==len(times),'L1b variable length mismatch: '+name)
+            columns.append(a)
+        raw=np.stack(columns,axis=1)
+        valid=selected&np.all(np.isfinite(raw)&(raw>=0),axis=1)
+        positions=[0,1,2,3,4,5,12,13,14]
+        for j,c in enumerate(positions):
+            for k in range(288):
+                a=raw[selected&(bins==k),j]; a=a[np.isfinite(a)&(a>=0)]
+                if len(a): summary[k,c]=np.mean(a)
+        for name,placeholder in profile['missing_geometry'].items():
+            # Use real compatible geophysical fields when present. Do not derive magnetic coordinates from geographic lat/lon.
+            aliases={'abs_mlat':('aacgm_lat_foot','aacgm_lat'),'L':('L_IGRF','L'),
+                     'ifc':('mep_IFC_on','mep_IFC','ifc')}.get(name,())
+            found=next((n for n in aliases if n in ds.variables),None)
+            if found:
+                a=np.ma.asarray(ds[found][:],dtype=np.float64).filled(np.nan).reshape(-1)
+                need(len(a)==len(times),'geometry length mismatch: '+found)
+                if name=='abs_mlat': a=np.abs(a)
+                if name=='L': a=np.minimum(a,20)
+                if name=='ifc': a=(a>0).astype(float)
+                for k in range(288):
+                    v=a[selected&(bins==k)]; v=v[np.isfinite(v)]
+                    summary[k,_C[name]]=np.median(v) if len(v) else placeholder
+                used[name]=found
+            elif name in ('mlt_sin','mlt_cos') and 'MLT' in ds.variables:
+                a=np.ma.asarray(ds['MLT'][:],dtype=np.float64).filled(np.nan).reshape(-1)
+                need(len(a)==len(times),'MLT length mismatch')
+                a=np.where((a>=0)&(a<=24),a,np.nan)*np.pi/12.0
+                a=np.sin(a) if name=='mlt_sin' else np.cos(a)
+                for k in range(288):
+                    v=a[selected&(bins==k)]; v=v[np.isfinite(v)]
+                    summary[k,_C[name]]=np.mean(v) if len(v) else placeholder
+                used[name]='MLT'
+            elif name=='polar' and 'abs_mlat' in used:
+                summary[:,_C[name]]=(summary[:,_C['abs_mlat']]>=60).astype(np.float32)
+                used[name]='abs_mlat >= 60 deg (demo bin approximation)'
+            else:
+                summary[:,_C[name]]=placeholder; missing.append(name)
+        summary[:,_C['n_valid']]=np.bincount(bins[valid],minlength=288)
+    details={'utc_date':date,'raw_samples':int(np.count_nonzero(selected)),
+             'real_flux_channels':required,'real_geometry':used,'placeholder_geometry':missing,
+             'accuracy_validated':False,'background':'constant synthetic history','context':'zero cold start'}
+    return summary,date,details
+
+
+def prepare_pd_demo(args,model):
+    need(args.input is not None,'PD demo needs --input L1b netCDF or 288x36 summary.npy')
+    need(not any(getattr(args,k,None) for k in ('tables','state','context','records','geo','sun')),
+         'demo path uses bundled placeholders; do not mix real calibration flags')
+    profile=read_demo_calibration(args.demo_calibration)['pd']
+    if Path(args.input).suffix.lower()=='.nc':
+        summary,date,details=l1b_demo_summary(args.input,profile,args.date)
+    else:
+        need(args.date is not None,'summary input needs --date YYYYMMDD')
+        summary=np.load(args.input,allow_pickle=False); date=args.date
+        details={'utc_date':date,'accuracy_validated':False,'background':'constant synthetic history','context':'zero cold start'}
+    day=_day_number(date); year=int(date[:4]); history=int(profile['history_days'])
+    need(5<=history<=27 and profile['eps']>0 and profile['std']>0 and profile['residual_scale']>0,'invalid PD demo constants')
+    tables={'eps':np.full(23,profile['eps']), 'cols':np.asarray(profile['cols']),
+            'mu':np.full(32,profile['mean'],np.float32),'sd':np.full(32,profile['std'],np.float32),
+            'scales':{year-1:np.full((18,23),profile['residual_scale'])},'history':history,'min_periods':5,
+            'qpos':model.contract['input_qpos'],'bits':model.contract['input_bits']}
+    state={d:np.full((18,23),profile['background_log_flux'],np.float32) for d in range(day-history,day)}
+    rows,_=day_codes(summary,state,tables,date)
+    if model.backend=='float': rows=(rows[:,:28].astype(np.float64)*2.0**(-tables['qpos'])).astype(np.float32)
+    details['input_at_bounds_fraction']=float(np.mean((rows==-32768)|(rows==32767))) if model.backend=='reference' else None
+    rf=receptive_field(model.contract)
+    need(profile['initial_context_code']==0,'demo cold-start context currently requires initial_context_code=0')
+    x,valid=framed(rows,model.input_shape[0],rf)
+    save_input(args.output,x,model,valid,'real data + arbitrary PD calibration:'+str(args.input),
+               calibration_mode=np.asarray('arbitrary_demo'),
+               calibration_sha256=np.asarray(hashlib.sha256(Path(args.demo_calibration).read_bytes()).hexdigest()),
+               preparation_details=np.asarray(json.dumps(details)))

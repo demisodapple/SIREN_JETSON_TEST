@@ -72,6 +72,8 @@ def prepare(args):
     import numpy as np
     import preprocess as pp
     m=setup_model(args)
+    if args.demo_calibration and args.kind not in ('bus','pd'):
+        raise ValueError('--demo-calibration applies only to --kind bus or pd')
     if args.kind=='smoke':
         # Explicit synthetic label survives into every benchmark result.
         dtype=np.int16 if m.backend=='reference' else np.float32
@@ -151,6 +153,8 @@ def benchmark(args):
         raise ValueError('duration/repeat must be positive, warmup nonnegative')
     m=setup_model(args)
     x,meta,expected=load_input(args.input,m)
+    if meta['calibration_mode']=='arbitrary_demo':
+        print('DEMO CALIBRATION: DNN load/power experiment only; detection accuracy is unvalidated.',flush=True)
     ops=m.operations()
     # Validate supplied reference outside measurement, preserving sequential GRU states.
     validation={'expected_provided':expected is not None,'passed':None}
@@ -342,7 +346,9 @@ def together(args):
         write_json(folder/'system.json',{'kind':'concurrent_dnn','start_unix_s':max(starts),'end_unix_s':min(ends),
                    'union_start_unix_s':min(starts),'union_end_unix_s':max(ends),'models':[n for n,_ in assignments],
                    'scope':'intersection of three DNN workloads; no codec, no mission scheduling',
-                   'device':args.device,'threads_per_worker':args.threads,'results':[n+'.json' for n,_ in assignments]})
+                   'device':args.device,'threads_per_worker':args.threads,
+                   'calibration_modes':{r['model']:r['input']['calibration_mode'] for r in results},
+                   'results':[n+'.json' for n,_ in assignments]})
         print('Completed '+str(folder))
     finally:
         for p in children:
@@ -369,6 +375,8 @@ def parser():
     c.add_argument('--input'); c.add_argument('--output',required=True)
     c.add_argument('--dtype'); c.add_argument('--valid-rows',type=int); c.add_argument('--expected')
     c.add_argument('--stats'); c.add_argument('--time-column',default='time_s')
+    c.add_argument('--demo-calibration',help='explicit arbitrary demo JSON for PD/BUS load tests')
+    c.add_argument('--bus-channel',help='select EIRSAT Channel; demo defaults to 15 when column exists')
     for flag in ('tables','state','date','context','records','geo','sun'): c.add_argument('--'+flag)
     c=sub.add_parser('bench',parents=[common]); c.set_defaults(func=benchmark)
     c.add_argument('--input',required=True); c.add_argument('--output',required=True)

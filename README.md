@@ -2,6 +2,64 @@
 
 Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 측정 → GRU와 ModernTCN 압축 비교 → 전력 로그 결합**을 진행한다. 모든 명령은 `run.py`에서 실행한다.
 
+**임의 통계·보정값으로 바로 DNN 부하·전력 측정하기**
+
+`demo_calibration.json`을 함께 제공한다. 아래 명령에서 `--demo-calibration demo_calibration.json`을 명시하면 외부 학습 통계·배경표 없이 실제 원자료에서 입력을 만든다. 신경망 가중치는 기존 것을 그대로 사용한다. 준비 단계는 측정 전에 수행하며 DNN 측정 시간에 포함되지 않는다.
+
+| 대상 | 준비할 원자료 | 현재 확인한 예시 |
+|---|---|---|
+| BUS | EIRSAT-1 Dataset.zip의 Flight Test Data/flighttest_dataset.csv | 실제 CSV의 OBT(초), Channel=15, 지정된 12개 전류·전압·상태 열 |
+| PD | NOAA POES/MetOp SEM-2 **L1b** 하루치 netCDF | MetOp-01의 `poes_m01_20220101_proc.nc` |
+| 압축 비교도 할 경우 | MetOp SEM-2 **L1a** 하루치 netCDF | `poes_m01_20220101_raw.nc`. PD용 proc 파일과 구분 |
+
+공개 자료 출처: [EIRSAT-1 Zenodo](https://zenodo.org/records/15256385), [NOAA MetOp-01 L1b 2022](https://www.ncei.noaa.gov/data/poes-metop-space-environment-monitor/access/l1b/v01r00/2022/metop01/). EIRSAT ZIP의 실제 이름은 `EIRSAT-1 Dataset.zip`이다. TVAC CSV도 같은 전처리 명령을 사용할 수 있다. 두 캠페인을 하나의 연속 시계열로 이어 붙이지 않는다.
+
+Jetson의 SSH 터미널에서:
+
+```bash
+cd ~/SIREN_JETSON_TEST
+git pull
+mkdir -p inputs results
+wget -O inputs/EIRSAT.zip 'https://zenodo.org/api/records/15256385/files/EIRSAT-1%20Dataset.zip/content'
+python3 -m zipfile -e inputs/EIRSAT.zip inputs
+wget -O inputs/poes_m01_20220101_proc.nc 'https://www.ncei.noaa.gov/data/poes-metop-space-environment-monitor/access/l1b/v01r00/2022/metop01/poes_m01_20220101_proc.nc'
+```
+
+이미 파일을 갖고 있다면 다운로드를 생략하고 실제 경로를 `--input`에 넣는다. 호환 PyTorch와 `requirements.txt`의 패키지가 설치된 환경에서 입력을 준비한다.
+
+```bash
+python3 run.py prepare --kind bus --model bus --demo-calibration demo_calibration.json --time-column OBT --input 'inputs/EIRSAT-1 Dataset/Flight Test Data/flighttest_dataset.csv' --output inputs/model2_BUS_demo.npz
+python3 run.py prepare --kind pd --model pd --demo-calibration demo_calibration.json --input inputs/poes_m01_20220101_proc.nc --output inputs/model1_PD_demo.npz
+```
+
+CPU에서 작은 실행부터 확인하고, 외부 계측기를 기록 상태로 둔 채 DNN을 반복 실행한다.
+
+```bash
+python3 run.py bench --model bus --input inputs/model2_BUS_demo.npz --duration 60 --repeat 3 --output results/model2_BUS_demo.json
+python3 run.py bench --model pd --input inputs/model1_PD_demo.npz --duration 60 --repeat 3 --output results/model1_PD_demo.json
+```
+
+GPU로 **FP32 이식 경로**를 측정하려면 입력 준비 두 명령에도 `--backend float`를 넣고 다른 출력 이름을 사용한다. 측정 명령에는 `--backend float --device cuda`를 함께 넣는다. 기본 `reference` 경로는 INT64/FP64 정수 계산 재현이며 네이티브 INT8 GPU 성능이 아니다. 각 실행 방식의 상세 조건은 아래 표를 참고한다.
+
+임의값의 의미:
+
+| 항목 | 제공하는 값·처리 |
+|---|---|
+| BUS 표준화 | 지정된 12채널 순서, 평균 0, 임의 고정 분모: CMC 전류 4096, 전압·버스 전류·스위치 비트맵 1024, 배터리 전류 방향 1. 실제 학습 표준편차가 아니라 원자료 코드값의 과도한 포화를 줄이는 부하 시험용 값 |
+| PD | eps=1, 평균 0, 표준편차 1, 잔차 scale=1, 직전 27일 배경 log flux=0, 초기 문맥 코드=0 |
+| PD 지리·품질 정보 | 실제 L1b에 있으면 자기위도·L·MLT·IFC 사용. 없는 항목은 JSON의 상수 사용, 사용한 원자료 열·대체 항목 기록 |
+| 결과 표시 | `input.calibration_mode = arbitrary_demo`, 보정 JSON SHA-256, 포화 비율, 대체 항목. 탐지 정확도는 검증하지 않음 |
+
+이 측정은 **실제 관측값과 임의 보정으로 만든 입력에서의 DNN 부하·보드 전력**이다. 정식 전처리의 탐지 성능이나 대표 운용 전력을 검증한 결과로 해석하지 않는다. 배경·초기 문맥은 합성 값이고, dtype 범위를 벗어나는 입력은 클리핑되며 그 비율을 기록한다. BUS 모델 내부의 학습된 가중치는 바꾸지 않는다.
+
+외부 전력 CSV를 확보하면 아래처럼 측정 시각과 결합한다. `tegrastats`의 상태 기록만으로 외부 계측이 완료되는 것은 아니다. CSV 시간은 Jetson 측정 결과와 같은 Unix 시각 기준이어야 한다.
+
+```bash
+python3 run.py power --input inputs/power.csv --result results/model1_PD_demo.json --output results/model1_PD_demo_power.json
+```
+
+원자료 없이 부하 실행만 확인하려면 기존 `prepare --kind smoke`도 사용할 수 있다. 아래의 외부 통계·상태 파일 요구사항은 **정식 전처리 경로**에 해당하며 위 데모 모드는 이를 명시적으로 대체한다.
+
 | 파일 | 역할 |
 |---|---|
 | `run.py` | 환경 확인, 전처리, 연산량 계산, 성능 측정, 압축·복원, 세 모델 동시 실행, 전력 로그 결합 |
@@ -92,7 +150,7 @@ MAC는 곱셈 후 누적 덧셈이다. **1 MAC = 2 operations**로 계산한다.
 | BUS | 하우스키핑 CSV → 50초 보간 → 표준화 → 64시점 창, 보폭 16 | 학습 시의 `channels`, `mean`, `std` 통계 NPZ. **원본 저장소에 없음** |
 | PD | 5분 요약 `.npy` 또는 원본 도구의 281바이트 레코드 → 배경 잔차·정규화·창 | ASTRAZT1 표, 이전 날짜 상태, 전날 입력 코드. 레코드부터 처리하려면 지자기·태양 표도 필요. **현재 저장소에 없음** |
 
-PD의 일반 netCDF에서 281바이트 레코드를 만드는 어댑터는 제공하지 않는다. 필요한 데이터 포맷과 보정표를 추정해 생성하지 않는다. 준비된 모델 입력을 받으면 원자료 전처리 없이 DNN 측정을 먼저 진행할 수 있다.
+정식 PD 경로의 일반 netCDF에서 281바이트 레코드를 만드는 어댑터는 제공하지 않는다. 위 데모 모드는 L1b를 직접 읽어 명시적인 대체 통계·배경값으로 입력을 생성한다. 정식 모델 입력을 받으면 원자료 전처리 없이 DNN 측정을 진행할 수 있다.
 
 이미 준비된 정수 입력 가져오기 예시:
 

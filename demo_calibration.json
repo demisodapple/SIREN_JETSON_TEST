@@ -1,0 +1,28 @@
+{
+  "schema": "siren-demo-calibration-v1",
+  "purpose": "DNN runtime and board-power experiments only; arbitrary calibration, not detection accuracy",
+  "bus": {
+    "channels": [
+      "platform.CMC.current5V", "platform.CMC.voltage5V",
+      "platform.EPS.actualSwitchStatesBitmap",
+      "platform.EPS.busCurrents_0", "platform.EPS.busCurrents_1",
+      "platform.EPS.busCurrents_2", "platform.EPS.busCurrents_3",
+      "platform.EPS.busVoltages_0", "platform.EPS.busVoltages_1",
+      "platform.EPS.busVoltages_2", "platform.EPS.busVoltages_3",
+      "platform.BAT.batteryCurrentDir"
+    ],
+    "mean": [0,0,0,0,0,0,0,0,0,0,0,0],
+    "std": [4096,1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,1]
+  },
+  "pd": {
+    "eps": 1.0,
+    "mean": 0.0,
+    "std": 1.0,
+    "residual_scale": 1.0,
+    "background_log_flux": 0.0,
+    "history_days": 27,
+    "initial_context_code": 0,
+    "cols": [0,1,2,3,4,5,12,13,14,23,24,25,26,27,28,29,30,54,55,56,57,58,59,60,61,68,69,70,65535,65535,65535,65535],
+    "missing_geometry": {"abs_mlat":0,"L":0,"mlt_sin":0,"mlt_cos":1,"polar":0,"saa":0,"ifc":0}
+  }
+}
