@@ -14,6 +14,7 @@ import time
 import threading
 import signal
 import math
+import hashlib
 from power import integrate_power, sensor_candidates, select_sensor, PowerRecorder, attach_recorded_power, is_input_sensor
 
 ROOT = Path(__file__).resolve().parent
@@ -143,6 +144,31 @@ def write_json(path, data):
     with open(str(path), 'x', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
         f.write('\n')
+
+
+def file_sha_light(path):
+    h=hashlib.sha256()
+    with open(str(path),'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024*1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def wait_ready(assignments, children, folder, status, deadline, args, offsets):
+    last_display=0.
+    while True:
+        status.preparing([(n,(folder/(n+'.ready.json')).exists()) for n,_ in assignments])
+        for (name,_),worker in zip(assignments,children):
+            if worker.poll() is not None:
+                drain_logs(folder,[n for n,_ in assignments],offsets)
+                raise RuntimeError('%s worker failed during startup: %s; see %s' %
+                    (name,failure_status(worker.returncode),folder/(name+'.log')))
+        if all((folder/(assignments[i][0]+'.ready.json')).exists() for i in range(len(children))):
+            return
+        if not getattr(args,'no_progress',False) and time.monotonic()-last_display>=args.progress_interval:
+            drain_logs(folder,[n for n,_ in assignments],offsets); last_display=time.monotonic()
+        if time.monotonic()>deadline: raise TimeoutError('model loading/warmup timed out')
+        time.sleep(.1)
 
 
 def command_output(command):
@@ -322,7 +348,10 @@ def _benchmark(args,progress):
     for index in range(args.warmup):
         m.reset(); m.forward(x[:1]); m.synchronize()
         progress.advance(index+1)
-    if args.gate: progress.stage('Ready; waiting for other models')
+    if args.gate:
+        if m.device.type=='cuda':
+            m.synchronize(); torch.cuda.empty_cache()
+        progress.stage('Ready; waiting for other models')
     gate(args)
     result={'schema':1,'kind':'dnn','model':m.name,'backend':m.backend,'implementation':m.description,
             'device':str(m.device),'cudnn_mode':getattr(args,'cudnn_mode','deterministic'),'threads':args.threads,'torch':torch.__version__,'python':sys.version,
@@ -465,6 +494,9 @@ def together(args):
     go=folder/'START'
     children=[]; logs=[]; offsets={}
     assignments=[('pd',args.pd_input),('bus',args.bus_input),(args.comp_model,args.comp_input)]
+    deadline=time.monotonic()+args.startup_timeout
+    health=telemetry(str(folder/'tegrastats.txt') if args.tegrastats else None)
+    health.__enter__()
     try:
         for name,inp in assignments:
             log=open(str(folder/(name+'.log')),'x',encoding='utf-8'); logs.append(log)
@@ -472,22 +504,13 @@ def together(args):
                  '--device',args.device,'--threads',str(args.threads),'--input',str(Path(inp).resolve()),
                  '--output',str(folder/(name+'.json')),'--duration',str(args.duration),'--repeat','1',
                  '--warmup',str(args.warmup),'--gate',str(go),'--ready',str(folder/(name+'.ready.json')),
-                 '--startup-timeout',str(args.startup_timeout)]+progress_flags(args)+cudnn_flags(args)
+                 '--startup-timeout',str(max(1.,deadline-time.monotonic()))]+progress_flags(args)+cudnn_flags(args)
             children.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT))
-        deadline=time.monotonic()+args.startup_timeout
+            if args.startup=='sequential':
+                wait_ready(assignments,children,folder,status,deadline,args,offsets)
+        wait_ready(assignments,children,folder,status,deadline,args,offsets)
         last_display=0.
-        status.preparing([(n,(folder/(n+'.ready.json')).exists()) for n,_ in assignments],True)
-        while not all((folder/(name+'.ready.json')).exists() for name,_ in assignments):
-            status.preparing([(n,(folder/(n+'.ready.json')).exists()) for n,_ in assignments])
-            if not getattr(args,'no_progress',False) and time.monotonic()-last_display>=args.progress_interval:
-                drain_logs(folder,[n for n,_ in assignments],offsets); last_display=time.monotonic()
-            for (name,_),worker in zip(assignments,children):
-                if worker.poll() is not None:
-                    drain_logs(folder,[n for n,_ in assignments],offsets)
-                    raise RuntimeError('%s worker failed during startup: %s; see %s'%(name,failure_status(worker.returncode),folder/(name+'.log')))
-            if time.monotonic()>deadline: raise TimeoutError('model loading/warmup timed out')
-            time.sleep(.1)
-        with telemetry(str(folder/'tegrastats.txt') if args.tegrastats else None):
+        with contextlib.ExitStack():
             go.write_text('start',encoding='ascii')
             dispatched=time.monotonic()
             status.measuring(dispatched,args.duration,[(n,p.poll()) for (n,_),p in zip(assignments,children)],True)
@@ -510,7 +533,7 @@ def together(args):
         write_json(folder/'system.json',{'kind':'concurrent_dnn','start_unix_s':max(starts),'end_unix_s':min(ends),
                    'union_start_unix_s':min(starts),'union_end_unix_s':max(ends),'models':[n for n,_ in assignments],
                    'scope':'intersection of three DNN workloads; no codec, no mission scheduling',
-                   'device':args.device,'threads_per_worker':args.threads,
+                   'device':args.device,'threads_per_worker':args.threads,'startup':args.startup,
                    'calibration_modes':{r['model']:r['input']['calibration_mode'] for r in results},
                    'synthetic_inputs':{r['model']:r['input']['synthetic'] for r in results},
                    'status_output':{'enabled':status.enabled,'interval_seconds':status.interval},
@@ -524,6 +547,7 @@ def together(args):
                 try: p.wait(timeout=5)
                 except subprocess.TimeoutExpired: p.kill(); p.wait()
         for log in logs: log.close()
+        health.__exit__(None,None,None)
 
 
 def sensors_command(args):
@@ -572,23 +596,21 @@ def _trial(args,folder_created=False):
     if args.duration<=0 or args.repeat<1 or args.warmup<0 or args.threads<1:
         raise ValueError('duration/repeat/threads must be positive; warmup nonnegative')
     OverallStatus(enabled=False,interval=args.status_interval)  # validate before worker launch
-    import torch
-    if args.device=='cuda' and not torch.cuda.is_available():
-        raise ValueError('CUDA unavailable; check NVIDIA PyTorch or use --device cpu')
+    # Wrappers never import torch/models or initialize their own CUDA context.
+    # Each inference worker checks CUDA availability.
     folder=Path(args.output).resolve()
     if not folder_created: folder.mkdir(parents=True,exist_ok=False)
     manifest=json.loads((ROOT/'dummy_data'/'manifest.json').read_text(encoding='utf-8'))
     model_names=('pd','bus',args.comp_model)
     inputs={n:ROOT/manifest['inputs'][n+'_'+args.backend]['file'] for n in model_names}
-    from models import file_sha
     for name,path in inputs.items():
-        if file_sha(path)!=manifest['inputs'][name+'_'+args.backend]['sha256']:
+        if file_sha_light(path)!=manifest['inputs'][name+'_'+args.backend]['sha256']:
             raise ValueError('bundled dummy input hash mismatch: '+str(path))
     common=['--backend',args.backend,'--device',args.device,'--threads',str(args.threads),
             '--duration',str(args.duration),'--warmup',str(args.warmup)]+progress_flags(args)+cudnn_flags(args)
     outputs=[]
     write_json(folder/'trial_config.json',{'models':list(model_names),'synthetic':True,'backend':args.backend,
-        'device':args.device,'cudnn_mode':args.cudnn_mode,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
+        'device':args.device,'cudnn_mode':args.cudnn_mode,'startup':args.startup,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
         'scope':'DNN only; preprocessing, compression and model loading excluded',
         'power_note':'module INA3221 log enabled' if args.record_power else 'no power capture; supply external CSV or --record-power',
         'status_output':{'enabled':not args.quiet_status,'interval_seconds':args.status_interval}})
@@ -622,7 +644,7 @@ def _trial(args,folder_created=False):
             output=folder/('together_%02d'%(repeat+1))
             extra=['together','--pd-input',str(inputs['pd']),'--bus-input',str(inputs['bus']),
                    '--comp-input',str(inputs[args.comp_model]),'--comp-model',args.comp_model,'--output',str(output),
-                   '--startup-timeout',str(args.startup_timeout),
+                   '--startup-timeout',str(args.startup_timeout),'--startup',args.startup,
                    '--status-label','REPEAT %d/%d'%(repeat+1,args.repeat)]+common+status_flags(args)
             if args.tegrastats: extra+=['--tegrastats']
             child(extra,'together_%02d.log'%(repeat+1)); outputs.append(output/'system.json')
@@ -641,6 +663,8 @@ def _trial(args,folder_created=False):
 def parser():
     p=argparse.ArgumentParser(description='SIREN Jetson: one CLI for preparation, models, compression and measurements')
     sub=p.add_subparsers(dest='command'); sub.required=True
+    from gpu_shared import add_parser
+    add_parser(sub)
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument('--model',choices=['pd','bus','comp','gru'],required=True)
     common.add_argument('--device',choices=['cpu','cuda'],default='cpu')
@@ -680,6 +704,7 @@ def parser():
     c=sub.add_parser('decode',parents=[common]); c.set_defaults(func=decode_command)
     c.add_argument('--input',required=True); c.add_argument('--output',required=True)
     c=sub.add_parser('together',parents=[progress_options,status_options]); c.set_defaults(func=together)
+    c.add_argument('--startup',choices=['sequential','parallel'],default='sequential',help='load/warm each model before starting the next; inference still concurrent')
     c.add_argument('--cudnn-mode',choices=['deterministic','heuristic','off'],default='deterministic')
     c.add_argument('--status-label',help=argparse.SUPPRESS)
     for name in ('pd','bus','comp'): c.add_argument('--'+name+'-input',required=True)
@@ -699,6 +724,7 @@ def parser():
     c.add_argument('--output',required=True); c.add_argument('--duration',type=float,default=30.)
     c.add_argument('--interval',type=float,default=.1); c.add_argument('--sensor')
     c=sub.add_parser('trial',parents=[progress_options,status_options]); c.set_defaults(func=trial)
+    c.add_argument('--startup',choices=['sequential','parallel'],default='sequential',help='load/warm each model before starting the next; inference still concurrent')
     c.add_argument('--cudnn-mode',choices=['deterministic','heuristic','off'],default='deterministic')
     c.add_argument('--comp-model',choices=['comp','gru'],default='comp',help='compression predictor; comp=ModernTCN')
     c.add_argument('--record-power',action='store_true',help='record main-module VDD_IN from read-only INA3221 sysfs')

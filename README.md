@@ -1,5 +1,29 @@
 # SIREN JETSON TEST
 
+## Nano GPU 동시 측정: 권장 실행
+
+4 GB Nano에서는 기존 `trial --phase together --device cuda`의 여러 Python/CUDA 프로세스가 메모리 부족으로 종료될 수 있다. `gpu-shared`는 **프로세스 하나 안에서 모델별 스레드와 CUDA 스트림을 유지**한다. 모델 3개는 동시에 추론 요청을 보내며, GPU 커널의 실제 중첩 실행까지 보장한다는 뜻은 아니다.
+
+```bash
+cd ~/SIREN_JETSON_TEST
+source .venv/bin/activate
+export OPENBLAS_CORETYPE=ARMV8
+python3 -u run.py gpu-shared --comp-model comp --duration 60 --repeat 3 --warmup 3 --record-power --tegrastats --output "results/GPU_TCN_$(date +%Y%m%d_%H%M%S)"
+```
+
+GRU 구성은 `--comp-model gru` 및 새로운 결과 폴더를 사용한다. FP32·cuDNN off·배치 1을 사용하며 가중치와 더미 입력은 기존 trial과 동일하다. 3개 모델 준비 후 각 60초를 3회 측정한다. 입력 전처리·모델 로딩·예열은 측정 구간에서 제외한다.
+
+| 결과 | 의미 |
+|---|---|
+| `power.csv` | 준비부터 종료까지 모듈 입력 전력 원본, 기본 약 10 Hz |
+| `together_01/pd.json`, `bus.json`, `comp.json` 또는 `gru.json` | 모델별 추론 시간, 고정 연산량, GOPS, 입력/가중치 해시 |
+| `together_01/system_power.json` | 3개 추론 구간이 겹치는 동안 모듈 평균 전력·관측 최대 전력 |
+| `together_01/system.json` | 프로세스 전체 CUDA 메모리, 총 연산량/전체 실행 구간으로 구한 합산 GOPS |
+| `tegrastats.log` | 모델 준비부터 종료까지 시스템 메모리·GPU 사용률·온도 |
+| `power_results.json` | 전력 분석 결과 파일 목록 |
+
+`*_power.json`의 모델별 전력도 **모듈 전체 전력**이며 모델 하나의 전력이 아니다. 약 10 Hz 관측 최대값은 순간 피크나 100 Hz 계측을 대체하지 않는다. GOPS는 행렬/합성곱 MAC 수×2를 추론 시간으로 나눈 값이다. 시간에는 전체 DNN·호출·스트림 대기가 포함되지만 연산량 분자는 활성화·정규화 등을 제외한다. CPU의 기존 여러 프로세스 실험과 실행 구조가 달라 단순 GPU 가속비로 해석하지 않는다.
+
 GPU 첫 추론에서 종료되면 [GPU 재진단 절차](GPU_RETRY.md)를 따른다. `gpu_probe.py`가 단계·층별 메모리 로그를 남기며, `--cudnn-mode off`도 GPU CUDA 실행이다. 실제 보드 성공 여부는 진단 결과로 확인한다.
 
 Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 측정 → GRU와 ModernTCN 압축 비교 → 전력 로그 결합**을 진행한다. 모든 명령은 `run.py`에서 실행한다.

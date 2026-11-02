@@ -28,6 +28,51 @@ TEST_TMP.mkdir(exist_ok=True)
 
 
 class TestGPUOptions(unittest.TestCase):
+    def test_float_source_release_preserves_outputs(self):
+        # Shared runner discards CPU source copies only after input/OPS setup.
+        for name in ('pd','bus','comp','gru'):
+            m=models.Model(name,backend='float')
+            x=torch.zeros([1]+m.input_shape)
+            m.reset(); before=m.forward(x).clone()
+            m.operations()
+            m.checkpoint=None; m.contract=None
+            m.reset(); after=m.forward(x)
+            torch.testing.assert_close(before,after,rtol=0,atol=0)
+
+    def test_shared_measure_counts_full_frames(self):
+        from gpu_shared import measure
+        class FakeModel:
+            def __init__(self): self.seen=[]; self.resets=0
+            def reset(self): self.resets+=1
+            def forward(self,x): self.seen.append(x.clone()); return x
+        model=FakeModel(); data=torch.arange(4).reshape(4,1,1)
+        sync=mock.Mock()
+        # Three full inferences, cycling through the existing prepared frames.
+        with mock.patch('gpu_shared.time.perf_counter',side_effect=[0,.01,.11,.12,.13,.23,.24,.25,.35,.36,.37]):
+            result,_=measure(model,data,{'valid_rows':[2,3,4,5]},
+                             {'operations_per_frame':100},.3,sync)
+        self.assertEqual(result['frames'],3)
+        self.assertEqual(result['valid_rows'],9)
+        self.assertAlmostEqual(result['inference_seconds'],.3)
+        self.assertAlmostEqual(result['gops'],1e-6)
+        self.assertEqual(sync.call_count,4)
+
+    def test_ready_barrier_and_failed_worker(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as tmp:
+            folder=Path(tmp)
+            assignments=[('pd','p'),('bus','b'),('comp','c')]
+            args=SimpleNamespace(no_progress=True,progress_interval=2)
+            status=run.OverallStatus(enabled=False)
+            worker=mock.Mock(); worker.poll.return_value=None
+            (folder/'pd.ready.json').write_text('{}')
+            run.wait_ready(assignments,[worker],folder,status,time.monotonic()+1,args,{})
+            with self.assertRaises(TimeoutError):
+                run.wait_ready(assignments,[worker,worker],folder,status,time.monotonic()-1,args,{})
+            worker.poll.return_value=-9; worker.returncode=-9
+            with self.assertRaisesRegex(RuntimeError,'signal'):
+                run.wait_ready(assignments,[worker],folder,status,time.monotonic()+1,args,{})
+
+
     def test_modes_and_wrappers(self):
         for mode in ('deterministic', 'heuristic', 'off'):
             args=run.parser().parse_args(['trial','--output','unused','--cudnn-mode',mode])

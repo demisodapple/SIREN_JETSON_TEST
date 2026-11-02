@@ -1,5 +1,7 @@
 # Jetson Nano GPU 재진단
 
+**2026-11-02 재진단:** 여러 프로세스는 순차 준비로 바꿔도 두 번째 GPU 프로세스 초기화 때 OOM이 재현됐다. 같은 입력·가중치의 `gpu-shared`는 세 모델 동시 실행을 통과했다. 현재 실행 명령은 [README](README.md)의 첫 표를 따른다. 아래 절차는 실패 재현과 원인 분리용 기록이며, 기존 `trial ... together`를 Nano의 권장 실행으로 사용하지 않는다.
+
 | 확인된 사실 | 해석 |
 |---|---|
 | 이전 커널 로그의 OOM killer가 python3 종료 | 시스템 메모리 부족으로 종료된 사실은 확인 |
@@ -91,3 +93,13 @@ cuDNN 모드는 trial 설정과 개별 모델 결과에 저장한다. FP32, 입�
 근거: NVIDIA CUDA for Tegra의 메모리 구조 문서와 PyTorch 1.10 cuDNN backend 소스.
 https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/index.html
 https://github.com/pytorch/pytorch/blob/v1.10.0/torch/backends/cudnn/__init__.py
+
+
+## 동시 준비 중 OOM 수정
+
+- trial 관리 프로세스에서 torch/models import 및 CUDA 확인 제거: 관리자는 GPU를 쓰지 않고 실제 작업 프로세스만 초기화한다.
+- together 기본 준비 방식은 sequential: PD 로딩·예열·대기 → BUS → 압축 모델 → 세 모델 동시에 추론. 추론을 순차 실행하는 옵션이 아니다.
+- 예열 후 CUDA 미사용 캐시를 반환하고 시작 신호를 기다린다. 실제 모델과 입력은 GPU에 유지한다.
+- `--tegrastats`는 모델 준비 전부터 기록하며 실패해도 준비 단계 로그를 보존한다.
+- `--startup parallel`로 기존 동시 준비 방식 재현 가능. 입력·가중치·FP32·OPS 정의는 동일하다.
+- 메모리가 여전히 부족하면 세 프로세스 유지 비용일 수 있다. 단독 성공만으로 세 모델 동시 실행 성공을 보장하지 않는다.
