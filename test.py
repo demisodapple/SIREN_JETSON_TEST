@@ -178,6 +178,32 @@ class TestProgress(unittest.TestCase):
 
 
 class TestPowerAcquisition(unittest.TestCase):
+    def test_pom_input_label_preserved_and_subrails_rejected(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp); path=self.fake_sensor(root,rail='POM_5V_IN',value='2342')
+            selected=power_module.select_sensor(root=root)
+            self.assertEqual(selected['rail'],'POM_5V_IN')
+            self.assertAlmostEqual(selected['power_w'],2.342)
+            self.assertTrue(power_module.is_input_sensor(selected))
+            with power_module.PowerRecorder(root/'pom.csv',.01,root=root) as rec:
+                time.sleep(.03)
+            self.assertEqual(rec.metadata['sensor']['rail'],'POM_5V_IN')
+            for name in ('POM_5V_GPU','POM_5V_CPU'):
+                (path.parent/'rail_name_0').write_text(name,encoding='utf-8')
+                with self.assertRaises(ValueError): power_module.select_sensor(root=root)
+
+    def test_input_rail_is_found_by_label_not_fixed_channel(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp); path=self.fake_sensor(root,rail='POM_5V_GPU')
+            (path.parent/'rail_name_1').write_text('POM_5V_IN',encoding='utf-8')
+            (path.parent/'in_power1_input').write_text('2342',encoding='utf-8')
+            selected=power_module.select_sensor(root=root)
+            self.assertTrue(selected['path'].endswith('in_power1_input'))
+            (path.parent/'rail_name_0').write_text('VDD_IN',encoding='utf-8')
+            with self.assertRaises(ValueError): power_module.select_sensor(root=root)
+            selected=power_module.select_sensor(path=path.parent/'in_power1_input',root=root)
+            self.assertEqual(selected['rail'],'POM_5V_IN')
+
     def fake_sensor(self,root,rail='VDD_IN',value='4000'):
         # ':' is unavailable in Windows fixture directory names; Linux uses iio:device0.
         device=Path(root)/'bus/i2c/drivers/ina3221x/6-0040/iio_device0'

@@ -4,6 +4,8 @@ Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 �
 
 **외부 전력계 없이 Nano 내장 센서로 측정**
 
+Nano 드라이버에 따라 입력 전원 레일 이름이 `POM_5V_IN`으로 표시된다. `VDD_IN`과 `POM_5V_IN`을 모두 지원하며, 실제 센서 이름은 결과에 그대로 보존한다. 채널 번호로 고정 선택하지 않으며 `POM_5V_CPU`·`POM_5V_GPU`는 입력 총량 대신 선택하거나 더하지 않는다. [NVIDIA Nano 레일 이름 설명](https://docs.nvidia.com/jetson/archives/l4t-archived/l4t-3276/Tegra%20Linux%20Driver%20Package%20Development%20Guide/hw_setup.html)
+
 초기 4GB Jetson Nano의 INA3221 `VDD_IN` 센서를 읽는 기능을 추가했다. `power.py`에 센서 검색·CSV 기록·전력 적분을 모았다. 센서 설정이나 전류 제한은 수정하지 않는다. `VDD_IN`은 **주 모듈 입력 전력**이며 캐리어보드·USB 장치 등을 모두 포함한 DC 잭 입력 전력을 측정했다고 해석하지 않는다. [NVIDIA 센서 설명](https://docs.nvidia.com/jetson/archives/l4t-archived/l4t-3276/Tegra%20Linux%20Driver%20Package%20Development%20Guide/power_management_nano.html)
 
 우선 Jetson SSH 터미널에서 센서를 확인한다. NumPy/PyTorch를 불러오지 않는 읽기 전용 점검이다.
@@ -16,7 +18,7 @@ export OPENBLAS_CORETYPE=ARMV8
 python3 run.py sensors
 ```
 
-`module_input_available: true`, `rail: VDD_IN`, `readable: true`가 확인돼야 측정한다. 경로는 일반적으로 `/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0/in_power0_input`이며 mW를 W로 변환한다. 센서가 없거나 읽을 수 없으면 자동 측정은 중단한다. 2GB Nano 등 센서가 없는 보드에서 값을 만들어 넣지 않는다.
+`module_input_available: true`, `rail: VDD_IN` 또는 `POM_5V_IN`, `readable: true`가 확인돼야 측정한다. 경로는 일반적으로 `/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0/in_power0_input`이며 mW를 W로 변환한다. 센서가 없거나 읽을 수 없으면 자동 측정은 중단한다. 2GB Nano 등 센서가 없는 보드에서 값을 만들어 넣지 않는다.
 
 유휴 전력 30초 기록(모델 작업을 끝낸 상태에서):
 

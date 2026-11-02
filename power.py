@@ -10,6 +10,13 @@ from pathlib import Path
 import threading
 import time
 
+MAIN_INPUT_RAILS=frozenset(('VDD_IN','POM_5V_IN'))
+
+
+def is_input_sensor(sensor):
+    """Match the rail label, not channel index; do not select CPU/GPU subrails."""
+    return sensor.get('readable',False) and sensor.get('rail') in MAIN_INPUT_RAILS
+
 
 def sensor_candidates(root='/sys'):
     root=Path(root)
@@ -36,12 +43,12 @@ def sensor_candidates(root='/sys'):
 
 def select_sensor(path=None,root='/sys'):
     sensors=sensor_candidates(root)
-    candidates=[s for s in sensors if s['readable'] and s['rail']=='VDD_IN']
+    candidates=[s for s in sensors if is_input_sensor(s)]
     if path:
         resolved=str(Path(path).resolve())
         candidates=[s for s in candidates if str(Path(s['path']).resolve())==resolved]
     if len(candidates)!=1:
-        raise ValueError('need one readable VDD_IN sensor; run "python3 run.py sensors". '
+        raise ValueError('need one readable main-input sensor (VDD_IN or POM_5V_IN); run "python3 run.py sensors". '
                          'No sensor power is fabricated. Candidates: '+json.dumps(sensors))
     return candidates[0]
 

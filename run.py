@@ -13,7 +13,7 @@ import sys
 import time
 import threading
 import signal
-from power import integrate_power, sensor_candidates, select_sensor, PowerRecorder, attach_recorded_power
+from power import integrate_power, sensor_candidates, select_sensor, PowerRecorder, attach_recorded_power, is_input_sensor
 
 ROOT = Path(__file__).resolve().parent
 
@@ -461,8 +461,8 @@ def together(args):
 
 def sensors_command(args):
     found=sensor_candidates()
-    result={'sensors':found,'module_input_available':any(s['rail']=='VDD_IN' and s['readable'] for s in found),
-            'note':'read-only INA3221 probe; VDD_IN is module input, not full board power'}
+    result={'sensors':found,'module_input_available':sum(bool(is_input_sensor(s)) for s in found)==1,
+            'note':'read-only INA3221 probe; VDD_IN/POM_5V_IN is module input, not full board power'}
     print(json.dumps(result,indent=2))
     if args.output: write_json(args.output,result)
 
@@ -470,13 +470,13 @@ def sensors_command(args):
 def record_power_command(args):
     if args.duration<=0: raise ValueError('duration must be positive')
     with PowerRecorder(args.output,args.interval,args.sensor) as recorder:
-        print('Recording module VDD_IN: '+recorder.sensor['path'],flush=True)
+        print('Recording module %s: %s'%(recorder.sensor['rail'],recorder.sensor['path']),flush=True)
         deadline=time.monotonic()+args.duration
         while time.monotonic()<deadline:
             time.sleep(min(.1,max(0,deadline-time.monotonic())))
             if recorder.error: raise RuntimeError(str(recorder.error))
     report=integrate_power(args.output,recorder.first,recorder.last,max(.05,args.interval*5))
-    print(json.dumps({'scope':'module VDD_IN','result':report,'metadata':recorder.metadata},indent=2))
+    print(json.dumps({'scope':'module main input','result':report,'metadata':recorder.metadata},indent=2))
 
 
 def trial(args):
