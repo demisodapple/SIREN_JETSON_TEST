@@ -2,6 +2,48 @@
 
 Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 측정 → GRU와 ModernTCN 압축 비교 → 전력 로그 결합**을 진행한다. 모든 명령은 `run.py`에서 실행한다.
 
+**외부 전력계 없이 Nano 내장 센서로 측정**
+
+초기 4GB Jetson Nano의 INA3221 `VDD_IN` 센서를 읽는 기능을 추가했다. `power.py`에 센서 검색·CSV 기록·전력 적분을 모았다. 센서 설정이나 전류 제한은 수정하지 않는다. `VDD_IN`은 **주 모듈 입력 전력**이며 캐리어보드·USB 장치 등을 모두 포함한 DC 잭 입력 전력을 측정했다고 해석하지 않는다. [NVIDIA 센서 설명](https://docs.nvidia.com/jetson/archives/l4t-archived/l4t-3276/Tegra%20Linux%20Driver%20Package%20Development%20Guide/power_management_nano.html)
+
+우선 Jetson SSH 터미널에서 센서를 확인한다. NumPy/PyTorch를 불러오지 않는 읽기 전용 점검이다.
+
+```bash
+cd ~/SIREN_JETSON_TEST
+git pull
+source .venv/bin/activate
+export OPENBLAS_CORETYPE=ARMV8
+python3 run.py sensors
+```
+
+`module_input_available: true`, `rail: VDD_IN`, `readable: true`가 확인돼야 측정한다. 경로는 일반적으로 `/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0/in_power0_input`이며 mW를 W로 변환한다. 센서가 없거나 읽을 수 없으면 자동 측정은 중단한다. 2GB Nano 등 센서가 없는 보드에서 값을 만들어 넣지 않는다.
+
+유휴 전력 30초 기록(모델 작업을 끝낸 상태에서):
+
+```bash
+python3 run.py record-power --duration 30 --output "results/idle_$(date +%Y%m%d_%H%M%S).csv"
+```
+
+그다음 PD + BUS + ModernTCN을 CPU에서 동시에 실행하며 기록한다.
+
+```bash
+python3 run.py trial --device cpu --phase together --duration 60 --repeat 3 --record-power --no-progress --output "results/TCN_power_$(date +%Y%m%d_%H%M%S)"
+```
+
+결과 폴더에 `power.csv`, `power.csv.json`(센서와 읽기 주기), `power_results.json`(분석 파일 목록)이 생긴다. 각 `together_01/system_power.json`은 세 DNN이 함께 동작한 공통 시간 구간의 평균 W, 관측 최대 W, 에너지 J를 담는다. 모델별 `pd_power.json` 등도 생기지만 **동시 실행 중의 모듈 전체 전력**이므로 모델 하나에만 귀속하거나 합산하지 않는다. 모델 로딩·예비 실행의 전력도 원본 CSV에는 있지만 DNN 측정 구간 분석에서는 제외한다.
+
+센서는 기본 0.1초 간격으로 읽는다. `--power-interval 0.01`을 지정하면 10ms 간격 읽기를 요청할 수 있으나 이는 **센서가 100Hz로 새 값을 변환한다는 보장이 아니다.** 실제 읽기 간격·누락과 값 변화 횟수를 기록한다. 내장 센서는 갱신 속도·정확도·기록 부하에 한계가 있으며 관측 최대 전력을 보드의 모든 순간 피크로 해석하지 않는다. 검증된 100Hz 전체 보드 전력이 필요하면 외부 계측기를 사용한다. 일시적인 CSV 공백이 허용치를 넘거나 센서 읽기가 실패하면 성공한 전력 결과로 처리하지 않는다.
+
+이후 압축 예측기만 GRU로 바꿔 비교할 수 있다.
+
+```bash
+python3 run.py trial --device cpu --phase together --comp-model gru --duration 60 --repeat 3 --record-power --no-progress --output "results/GRU_power_$(date +%Y%m%d_%H%M%S)"
+```
+
+`--comp-model comp` 기본값은 ModernTCN이다. `trial_config.json`과 `system.json`의 모델 목록에 선택한 예측기를 기록한다. GRU trial은 현재 `--backend float`만 지원한다. 온도·팬·전력 모드·주변 장치·로깅 주기를 동일하게 유지한다. 기본 동시 시험은 각 모델을 가능한 빠르게 반복 실행하는 최대 부하 조건이며, GRU와 ModernTCN의 채널 수·창 길이·처리 단위가 다르므로 **같은 자료량의 압축 효율 비교와 구분**한다. DNN만 실행하고 잔차/BZ2 압축은 포함하지 않는다.
+
+외부 전력 CSV 경로도 기존 `run.py power` 명령으로 계속 사용할 수 있다. 내장 센서 기록은 수집과 분석에 성공한 경우에만 전력 결과를 만든다. PC의 가짜 sysfs 파일 테스트는 소프트웨어 검증이며 실제 Nano 센서 검증이 아니다.
+
 **진행 표시와 첫 실행 진단**
 
 `bench`, `trial`, `together`는 기본으로 진행 상황을 표시한다. 추가 패키지가 필요하지 않다. SSH에서도 보이며 trial은 하위 프로세스 출력을 실시간으로 터미널과 모델별 로그에 함께 남긴다.

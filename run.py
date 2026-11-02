@@ -13,6 +13,7 @@ import sys
 import time
 import threading
 import signal
+from power import integrate_power, sensor_candidates, select_sensor, PowerRecorder, attach_recorded_power
 
 ROOT = Path(__file__).resolve().parent
 
@@ -386,33 +387,6 @@ def decode_command(args):
     print('Exact reconstruction verified by stored SHA-256.')
 
 
-def integrate_power(csv_path, start, end, max_gap=.05):
-    """CSV: time_s=Unix epoch seconds, power_w=board input watts. No clock guessing."""
-    import numpy as np
-    with open(csv_path,newline='',encoding='utf-8-sig') as f:
-        reader=csv.DictReader(f)
-        if not {'time_s','power_w'}<=set(reader.fieldnames or []):
-            raise ValueError('power CSV requires time_s (Unix epoch seconds), power_w (watts)')
-        data=np.asarray([(float(r['time_s']),float(r['power_w'])) for r in reader],np.float64)
-    if (len(data)<2 or not np.all(np.isfinite(data)) or np.any(np.diff(data[:,0])<=0)
-            or np.any(data[:,1]<0) or end<=start or max_gap<=0): raise ValueError('invalid power samples or interval')
-    t,p=data[:,0],data[:,1]
-    if start<t[0] or end>t[-1]: raise ValueError('power log does not cover complete measured interval; no extrapolation')
-    left=max(0,int(np.searchsorted(t,start,side='right'))-1)
-    right=min(len(t)-1,int(np.searchsorted(t,end)))
-    gaps=np.diff(t[left:right+1])
-    if len(gaps)==0 or np.max(gaps)>max_gap: raise ValueError('power log gap exceeds --max-gap; check sampling and clocks')
-    inside=(t>start)&(t<end)
-    tt=np.concatenate(([start],t[inside],[end]))
-    pp=np.interp(tt,t,p)
-    energy=float(np.sum((pp[:-1]+pp[1:])*.5*np.diff(tt)))
-    observed=p[(t>=start)&(t<=end)]
-    if len(observed)<1: raise ValueError('no measured sample inside interval')
-    return {'energy_j':energy,'mean_power_w':energy/(end-start),'observed_max_power_w':float(observed.max()),
-            'observed_samples':int(len(observed)),'median_sample_rate_hz':1/float(np.median(gaps)),
-            'max_gap_s':float(np.max(gaps)),'method':'trapezoid with interpolated boundaries; sampled maximum, not transient peak'}
-
-
 def power(args):
     data=json.loads(Path(args.result).read_text(encoding='utf-8'))
     runs=data.get('runs',[data])
@@ -485,7 +459,45 @@ def together(args):
         for log in logs: log.close()
 
 
+def sensors_command(args):
+    found=sensor_candidates()
+    result={'sensors':found,'module_input_available':any(s['rail']=='VDD_IN' and s['readable'] for s in found),
+            'note':'read-only INA3221 probe; VDD_IN is module input, not full board power'}
+    print(json.dumps(result,indent=2))
+    if args.output: write_json(args.output,result)
+
+
+def record_power_command(args):
+    if args.duration<=0: raise ValueError('duration must be positive')
+    with PowerRecorder(args.output,args.interval,args.sensor) as recorder:
+        print('Recording module VDD_IN: '+recorder.sensor['path'],flush=True)
+        deadline=time.monotonic()+args.duration
+        while time.monotonic()<deadline:
+            time.sleep(min(.1,max(0,deadline-time.monotonic())))
+            if recorder.error: raise RuntimeError(str(recorder.error))
+    report=integrate_power(args.output,recorder.first,recorder.last,max(.05,args.interval*5))
+    print(json.dumps({'scope':'module VDD_IN','result':report,'metadata':recorder.metadata},indent=2))
+
+
 def trial(args):
+    if args.comp_model=='gru' and args.backend!='float':
+        raise ValueError('GRU trial comparison currently requires --backend float')
+    # Probe before creating result folder or loading models. Missing sensors never
+    # silently produce a timing-only "power measurement".
+    if args.record_power: select_sensor(args.power_sensor)
+    if not args.record_power:
+        return _trial(args)
+    folder=Path(args.output).resolve()
+    if folder.exists(): raise ValueError('output folder exists; choose a new name')
+    with PowerRecorder(folder/'power.csv',args.power_interval,args.power_sensor) as recorder:
+        _trial(args,folder_created=True)
+    files=attach_recorded_power(folder,folder/'power.csv',recorder.metadata,args.power_interval)
+    write_json(folder/'power_results.json',{'files':files,'sensor':recorder.metadata,
+               'scope':'main module input, not total carrier-board power'})
+    print('Module power analysis complete; see '+str(folder/'power_results.json'),flush=True)
+
+
+def _trial(args,folder_created=False):
     """Bundled dummy DNNs: separate processes, then three concurrent workloads."""
     if args.duration<=0 or args.repeat<1 or args.warmup<0 or args.threads<1:
         raise ValueError('duration/repeat/threads must be positive; warmup nonnegative')
@@ -493,9 +505,10 @@ def trial(args):
     if args.device=='cuda' and not torch.cuda.is_available():
         raise ValueError('CUDA unavailable; check NVIDIA PyTorch or use --device cpu')
     folder=Path(args.output).resolve()
-    folder.mkdir(parents=True,exist_ok=False)
+    if not folder_created: folder.mkdir(parents=True,exist_ok=False)
     manifest=json.loads((ROOT/'dummy_data'/'manifest.json').read_text(encoding='utf-8'))
-    inputs={n:ROOT/manifest['inputs'][n+'_'+args.backend]['file'] for n in ('pd','bus','comp')}
+    model_names=('pd','bus',args.comp_model)
+    inputs={n:ROOT/manifest['inputs'][n+'_'+args.backend]['file'] for n in model_names}
     from models import file_sha
     for name,path in inputs.items():
         if file_sha(path)!=manifest['inputs'][name+'_'+args.backend]['sha256']:
@@ -503,10 +516,10 @@ def trial(args):
     common=['--backend',args.backend,'--device',args.device,'--threads',str(args.threads),
             '--duration',str(args.duration),'--warmup',str(args.warmup)]+progress_flags(args)
     outputs=[]
-    write_json(folder/'trial_config.json',{'models':['pd','bus','comp'],'synthetic':True,'backend':args.backend,
+    write_json(folder/'trial_config.json',{'models':list(model_names),'synthetic':True,'backend':args.backend,
         'device':args.device,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
         'scope':'DNN only; preprocessing, compression and model loading excluded',
-        'power_note':'external board power CSV required; tegrastats is health telemetry'})
+        'power_note':'module INA3221 log enabled' if args.record_power else 'no power capture; supply external CSV or --record-power'})
     def child(extra,logname):
         with open(str(folder/logname),'x',encoding='utf-8') as log:
             print('Running: '+' '.join(extra),flush=True)
@@ -526,7 +539,7 @@ def trial(args):
             if status!=0:
                 raise RuntimeError('trial worker failed: %s; see %s'%(failure_status(status),folder/logname))
     if args.phase in ('single','all'):
-        for name in ('pd','bus','comp'):
+        for name in model_names:
             output=folder/(name+'.json')
             extra=['bench','--model',name,'--input',str(inputs[name]),'--output',str(output),
                    '--repeat',str(args.repeat)]+common
@@ -536,7 +549,7 @@ def trial(args):
         for repeat in range(args.repeat):
             output=folder/('together_%02d'%(repeat+1))
             extra=['together','--pd-input',str(inputs['pd']),'--bus-input',str(inputs['bus']),
-                   '--comp-input',str(inputs['comp']),'--output',str(output),
+                   '--comp-input',str(inputs[args.comp_model]),'--comp-model',args.comp_model,'--output',str(output),
                    '--startup-timeout',str(args.startup_timeout)]+common
             if args.tegrastats: extra+=['--tegrastats']
             child(extra,'together_%02d.log'%(repeat+1)); outputs.append(output/'system.json')
@@ -601,7 +614,16 @@ def parser():
     c.add_argument('--input',required=True,help='external power CSV, Unix epoch time_s and power_w')
     c.add_argument('--result',required=True); c.add_argument('--output',required=True)
     c.add_argument('--max-gap',type=float,default=.05)
+    c=sub.add_parser('sensors'); c.set_defaults(func=sensors_command)
+    c.add_argument('--output',help='optional save path for discovered sensors')
+    c=sub.add_parser('record-power'); c.set_defaults(func=record_power_command)
+    c.add_argument('--output',required=True); c.add_argument('--duration',type=float,default=30.)
+    c.add_argument('--interval',type=float,default=.1); c.add_argument('--sensor')
     c=sub.add_parser('trial',parents=[progress_options]); c.set_defaults(func=trial)
+    c.add_argument('--comp-model',choices=['comp','gru'],default='comp',help='compression predictor; comp=ModernTCN')
+    c.add_argument('--record-power',action='store_true',help='record main-module VDD_IN from read-only INA3221 sysfs')
+    c.add_argument('--power-interval',type=float,default=.1,help='sensor polling interval, not conversion bandwidth')
+    c.add_argument('--power-sensor',help='explicit VDD_IN path shown by sensors command')
     c.add_argument('--backend',choices=['reference','float'],default='float')
     c.add_argument('--device',choices=['cpu','cuda'],default='cpu')
     c.add_argument('--phase',choices=['single','together','all'],default='all')
@@ -617,7 +639,7 @@ if __name__=='__main__':
     faulthandler.enable()
     args=parser().parse_args()
     try:
-        if hasattr(args,'output') and args.command not in ('together','trial') and Path(args.output).exists():
+        if getattr(args,'output',None) and args.command not in ('together','trial') and Path(args.output).exists():
             raise ValueError('output exists; choose a new name: '+args.output)
         args.func(args)
     except (ValueError,RuntimeError,OSError,ImportError,KeyError) as exc:

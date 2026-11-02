@@ -20,6 +20,7 @@ import models
 import preprocess as prep
 import reference
 import run
+import power as power_module
 
 torch.set_num_threads(1)
 TEST_TMP=Path(__file__).resolve().parent/'results'
@@ -174,6 +175,72 @@ class TestProgress(unittest.TestCase):
         self.assertEqual(out.getvalue(),'')
         self.assertIn('SIGILL',run.failure_status(-signal.SIGILL))
         self.assertIn('exit code 2',run.failure_status(2))
+
+
+class TestPowerAcquisition(unittest.TestCase):
+    def fake_sensor(self,root,rail='VDD_IN',value='4000'):
+        # ':' is unavailable in Windows fixture directory names; Linux uses iio:device0.
+        device=Path(root)/'bus/i2c/drivers/ina3221x/6-0040/iio_device0'
+        device.mkdir(parents=True,exist_ok=True)
+        (device/'rail_name_0').write_text(rail,encoding='utf-8')
+        p=device/'in_power0_input'; p.write_text(value,encoding='utf-8')
+        return p
+
+    def test_read_only_rail_selection_and_milliwatts(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp); path=self.fake_sensor(root)
+            original=path.read_bytes()
+            found=power_module.sensor_candidates(root)
+            self.assertEqual(found[0]['power_w'],4.)
+            selected=power_module.select_sensor(root=root)
+            self.assertEqual(selected['rail'],'VDD_IN')
+            self.assertEqual(path.read_bytes(),original)
+            (path.parent/'rail_name_0').write_text('VDD_CPU',encoding='utf-8')
+            with self.assertRaises(ValueError): power_module.select_sensor(root=root)
+
+    def test_recording_and_concurrent_interval_integration(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp); path=self.fake_sensor(root)
+            folder=root/'measurement'
+            with power_module.PowerRecorder(folder/'power.csv',.01,root=root) as recorder:
+                time.sleep(.03); start=time.time(); time.sleep(.06); end=time.time(); time.sleep(.03)
+            self.assertEqual(path.read_text(),'4000')
+            self.assertGreater(recorder.samples,3)
+            self.assertEqual(recorder.metadata['status'],'complete')
+            self.assertEqual(recorder.metadata['observed_value_changes'],0)
+            run.write_json(folder/'system.json',{'kind':'concurrent_dnn','start_unix_s':start,'end_unix_s':end})
+            files=power_module.attach_recorded_power(folder,folder/'power.csv',recorder.metadata,.01)
+            d=json.loads(Path(files[0]).read_text())
+            self.assertAlmostEqual(d['power']['mean_power_w'],4.)
+            self.assertAlmostEqual(d['power']['energy_j'],4*(end-start))
+            self.assertIn('module VDD_IN',d['power_scope'])
+            self.assertLessEqual(d['power_source']['start_unix_s'],start)
+
+    def test_missing_or_invalid_sensor_is_never_fabricated(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp)
+            with self.assertRaises(ValueError): power_module.select_sensor(root=root)
+            self.fake_sensor(root,value='nan')
+            with self.assertRaises(ValueError): power_module.PowerRecorder(root/'bad.csv',root=root)
+            self.assertFalse((root/'bad.csv').exists())
+
+    def test_gru_trial_selects_comparison_model(self):
+        args=run.parser().parse_args(['trial','--comp-model','gru','--output','unused'])
+        self.assertEqual(args.comp_model,'gru')
+        self.assertEqual(args.backend,'float')
+        args.backend='reference'
+        with self.assertRaises(ValueError): run.trial(args)
+
+    def test_acquisition_failure_is_reported_without_power_success(self):
+        with tempfile.TemporaryDirectory(dir=str(TEST_TMP)) as temp:
+            root=Path(temp); path=self.fake_sensor(root)
+            with self.assertRaises(RuntimeError):
+                with power_module.PowerRecorder(root/'failed.csv',.01,root=root) as recorder:
+                    path.write_text('-1',encoding='utf-8')
+                    time.sleep(.05)
+            meta=json.loads((root/'failed.csv.json').read_text())
+            self.assertEqual(meta['status'],'failed')
+            self.assertIsNotNone(meta['error'])
 
 
 class TestPreparationAndPower(unittest.TestCase):
