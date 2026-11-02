@@ -2,6 +2,22 @@
 
 Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 측정 → GRU와 ModernTCN 압축 비교 → 전력 로그 결합**을 진행한다. 모든 명령은 `run.py`에서 실행한다.
 
+**전력 측정 중 전체 진행바**
+
+`trial --phase together` 및 `together`는 모델별 상세 표시를 꺼도 전체 준비 상태와 측정 진행바를 기본 5초마다 출력한다. 기존 `--no-progress`는 하위 DNN별 상세 진행만 끄며 전체 상태는 유지한다.
+
+```text
+[POWER] Recording POM_5V_IN -> .../power.csv
+[REPEAT 1/3] PREPARING 2/3 ready | 8.0s | PD=LOADING/WARMUP | BUS=READY | COMP=READY
+[REPEAT 1/3] MEASURING [#####---------------] 25% | elapsed 15.0/60.0s | PD=RUNNING | BUS=RUNNING | COMP=RUNNING
+[REPEAT 1/3] DONE [####################] 100% | all model results saved
+[POWER] Analyzing recorded DNN intervals ...
+```
+
+PREPARING은 가중치 로딩과 예비 실행을 포함하며 실제 준비 완료 파일로 개수를 확인한다. 측정 진행률은 공통 시작 신호를 보낸 뒤의 경과 시간이다. DNN 내부 계산의 완료율을 의미하지 않으며, 목표 시간이 지나도 추론·결과 저장이 끝나지 않으면 99%에서 대기 상태를 표시한다. 실패한 작업을 100% 완료로 표시하지 않는다.
+
+`--status-interval 10`으로 전체 표시 간격을 바꿀 수 있다. 모든 주기적 상태 표시를 끄려면 `--no-progress --quiet-status`를 함께 지정한다. 전체 표시 여부와 간격도 결과 JSON에 기록하며 GRU/ModernTCN 비교에서 동일하게 유지한다. 이미 실행 중인 프로세스는 `git pull`로 변경되지 않으므로 다음 실행부터 적용된다. 중단 후 재시작할 경우 새 결과 폴더를 사용하며 기존 CSV는 부분 기록으로 보존된다.
+
 **외부 전력계 없이 Nano 내장 센서로 측정**
 
 Nano 드라이버에 따라 입력 전원 레일 이름이 `POM_5V_IN`으로 표시된다. `VDD_IN`과 `POM_5V_IN`을 모두 지원하며, 실제 센서 이름은 결과에 그대로 보존한다. 채널 번호로 고정 선택하지 않으며 `POM_5V_CPU`·`POM_5V_GPU`는 입력 총량 대신 선택하거나 더하지 않는다. [NVIDIA Nano 레일 이름 설명](https://docs.nvidia.com/jetson/archives/l4t-archived/l4t-3276/Tegra%20Linux%20Driver%20Package%20Development%20Guide/hw_setup.html)

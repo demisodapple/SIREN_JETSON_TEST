@@ -13,6 +13,7 @@ import sys
 import time
 import threading
 import signal
+import math
 from power import integrate_power, sensor_candidates, select_sensor, PowerRecorder, attach_recorded_power, is_input_sensor
 
 ROOT = Path(__file__).resolve().parent
@@ -76,6 +77,48 @@ def failure_status(code):
         try: return 'signal %s (%d)'%(signal.Signals(-code).name,-code)
         except ValueError: return 'signal %d'%(-code)
     return 'exit code %d'%code
+
+
+class OverallStatus:
+    """Wrapper status remains visible with quiet per-model inference workers.
+
+    Progress is elapsed time after dispatch, not completion inside a GPU kernel.
+    Only successful worker exit and result saving can produce the 100% line.
+    """
+    def __init__(self,label='TOGETHER',enabled=True,interval=5.):
+        if not math.isfinite(interval) or interval<=0:
+            raise ValueError('--status-interval must be finite and positive')
+        self.label,self.enabled,self.interval=label,enabled,interval
+        self.started=time.monotonic(); self.last=None
+
+    def _emit(self,text,force=False):
+        now=time.monotonic()
+        if self.enabled and (force or self.last is None or now-self.last>=self.interval):
+            print('[%s] %s'%(self.label,text),flush=True)
+            self.last=now
+
+    def preparing(self,states,force=False):
+        detail=' | '.join('%s=%s'%(name.upper(),'READY' if ready else 'LOADING/WARMUP') for name,ready in states)
+        count=sum(bool(ready) for _,ready in states)
+        self._emit('PREPARING %d/%d ready | %.1fs | %s'%(count,len(states),time.monotonic()-self.started,detail),force)
+
+    def measuring(self,started,duration,states,force=False):
+        elapsed=max(0.,time.monotonic()-started)
+        fraction=min(.99,elapsed/duration); n=int(fraction*20)
+        detail=' | '.join('%s=%s'%(name.upper(),'DONE' if code==0 else ('RUNNING' if code is None else failure_status(code)))
+                          for name,code in states)
+        line='MEASURING [%s%s] %2d%% | elapsed %.1f/%.1fs | %s'%('#'*n,'-'*(20-n),fraction*100,elapsed,duration,detail)
+        if elapsed>=duration: line+=' | waiting for current inferences/result saving'
+        self._emit(line,force)
+
+    def complete(self):
+        self._emit('DONE [####################] 100% | all model results saved',True)
+
+
+def status_flags(args):
+    flags=['--status-interval',str(args.status_interval)]
+    if args.quiet_status: flags.append('--quiet-status')
+    return flags
 
 
 def progress_flags(args):
@@ -400,6 +443,9 @@ def power(args):
 
 
 def together(args):
+    status=OverallStatus(getattr(args,'status_label',None) or 'TOGETHER',
+                         not getattr(args,'quiet_status',False),getattr(args,'status_interval',5.))
+    if args.duration<=0: raise ValueError('duration must be positive')
     folder=Path(args.output).resolve()
     folder.mkdir(parents=True,exist_ok=False)
     go=folder/'START'
@@ -416,7 +462,9 @@ def together(args):
             children.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT))
         deadline=time.monotonic()+args.startup_timeout
         last_display=0.
+        status.preparing([(n,(folder/(n+'.ready.json')).exists()) for n,_ in assignments],True)
         while not all((folder/(name+'.ready.json')).exists() for name,_ in assignments):
+            status.preparing([(n,(folder/(n+'.ready.json')).exists()) for n,_ in assignments])
             if not getattr(args,'no_progress',False) and time.monotonic()-last_display>=args.progress_interval:
                 drain_logs(folder,[n for n,_ in assignments],offsets); last_display=time.monotonic()
             for (name,_),worker in zip(assignments,children):
@@ -427,7 +475,10 @@ def together(args):
             time.sleep(.1)
         with telemetry(str(folder/'tegrastats.txt') if args.tegrastats else None):
             go.write_text('start',encoding='ascii')
+            dispatched=time.monotonic()
+            status.measuring(dispatched,args.duration,[(n,p.poll()) for (n,_),p in zip(assignments,children)],True)
             while any(p.poll() is None for p in children):
+                status.measuring(dispatched,args.duration,[(n,p.poll()) for (n,_),p in zip(assignments,children)])
                 if not getattr(args,'no_progress',False) and time.monotonic()-last_display>=args.progress_interval:
                     drain_logs(folder,[n for n,_ in assignments],offsets); last_display=time.monotonic()
                 for (name,_),worker in zip(assignments,children):
@@ -448,7 +499,9 @@ def together(args):
                    'device':args.device,'threads_per_worker':args.threads,
                    'calibration_modes':{r['model']:r['input']['calibration_mode'] for r in results},
                    'synthetic_inputs':{r['model']:r['input']['synthetic'] for r in results},
+                   'status_output':{'enabled':status.enabled,'interval_seconds':status.interval},
                    'results':[n+'.json' for n,_ in assignments]})
+        status.complete()
         print('Completed '+str(folder))
     finally:
         for p in children:
@@ -490,7 +543,10 @@ def trial(args):
     folder=Path(args.output).resolve()
     if folder.exists(): raise ValueError('output folder exists; choose a new name')
     with PowerRecorder(folder/'power.csv',args.power_interval,args.power_sensor) as recorder:
+        if not args.quiet_status:
+            print('[POWER] Recording %s -> %s'%(recorder.sensor['rail'],folder/'power.csv'),flush=True)
         _trial(args,folder_created=True)
+    if not args.quiet_status: print('[POWER] Analyzing recorded DNN intervals ...',flush=True)
     files=attach_recorded_power(folder,folder/'power.csv',recorder.metadata,args.power_interval)
     write_json(folder/'power_results.json',{'files':files,'sensor':recorder.metadata,
                'scope':'main module input, not total carrier-board power'})
@@ -501,6 +557,7 @@ def _trial(args,folder_created=False):
     """Bundled dummy DNNs: separate processes, then three concurrent workloads."""
     if args.duration<=0 or args.repeat<1 or args.warmup<0 or args.threads<1:
         raise ValueError('duration/repeat/threads must be positive; warmup nonnegative')
+    OverallStatus(enabled=False,interval=args.status_interval)  # validate before worker launch
     import torch
     if args.device=='cuda' and not torch.cuda.is_available():
         raise ValueError('CUDA unavailable; check NVIDIA PyTorch or use --device cpu')
@@ -519,7 +576,8 @@ def _trial(args,folder_created=False):
     write_json(folder/'trial_config.json',{'models':list(model_names),'synthetic':True,'backend':args.backend,
         'device':args.device,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
         'scope':'DNN only; preprocessing, compression and model loading excluded',
-        'power_note':'module INA3221 log enabled' if args.record_power else 'no power capture; supply external CSV or --record-power'})
+        'power_note':'module INA3221 log enabled' if args.record_power else 'no power capture; supply external CSV or --record-power',
+        'status_output':{'enabled':not args.quiet_status,'interval_seconds':args.status_interval}})
     def child(extra,logname):
         with open(str(folder/logname),'x',encoding='utf-8') as log:
             print('Running: '+' '.join(extra),flush=True)
@@ -550,7 +608,8 @@ def _trial(args,folder_created=False):
             output=folder/('together_%02d'%(repeat+1))
             extra=['together','--pd-input',str(inputs['pd']),'--bus-input',str(inputs['bus']),
                    '--comp-input',str(inputs[args.comp_model]),'--comp-model',args.comp_model,'--output',str(output),
-                   '--startup-timeout',str(args.startup_timeout)]+common
+                   '--startup-timeout',str(args.startup_timeout),
+                   '--status-label','REPEAT %d/%d'%(repeat+1,args.repeat)]+common+status_flags(args)
             if args.tegrastats: extra+=['--tegrastats']
             child(extra,'together_%02d.log'%(repeat+1)); outputs.append(output/'system.json')
     summary=[]
@@ -574,8 +633,11 @@ def parser():
     common.add_argument('--backend',choices=['reference','float'],default='reference')
     common.add_argument('--threads',type=int,default=1,help='CPU threads per process, not CPU power-off')
     progress_options=argparse.ArgumentParser(add_help=False)
-    progress_options.add_argument('--no-progress',action='store_true',help='disable heartbeat/progress output for final measurements')
+    progress_options.add_argument('--no-progress',action='store_true',help='disable per-model detailed progress; overall wrapper status is independent')
     progress_options.add_argument('--progress-interval',type=float,default=2.,help='progress heartbeat interval in seconds')
+    status_options=argparse.ArgumentParser(add_help=False)
+    status_options.add_argument('--quiet-status',action='store_true',help='disable overall wrapper status as well')
+    status_options.add_argument('--status-interval',type=float,default=5.,help='overall preparation/measurement status interval in seconds')
     c=sub.add_parser('check'); c.add_argument('--output',default='results/environment.json'); c.set_defaults(func=check)
     c=sub.add_parser('ops',parents=[common]); c.set_defaults(func=operations_command)
     c.add_argument('--output',required=True)
@@ -602,7 +664,8 @@ def parser():
     c.add_argument('--limit',type=int); c.add_argument('--tegrastats')
     c=sub.add_parser('decode',parents=[common]); c.set_defaults(func=decode_command)
     c.add_argument('--input',required=True); c.add_argument('--output',required=True)
-    c=sub.add_parser('together',parents=[progress_options]); c.set_defaults(func=together)
+    c=sub.add_parser('together',parents=[progress_options,status_options]); c.set_defaults(func=together)
+    c.add_argument('--status-label',help=argparse.SUPPRESS)
     for name in ('pd','bus','comp'): c.add_argument('--'+name+'-input',required=True)
     c.add_argument('--comp-model',choices=['comp','gru'],default='comp')
     c.add_argument('--backend',choices=['reference','float'],default='reference')
@@ -619,7 +682,7 @@ def parser():
     c=sub.add_parser('record-power'); c.set_defaults(func=record_power_command)
     c.add_argument('--output',required=True); c.add_argument('--duration',type=float,default=30.)
     c.add_argument('--interval',type=float,default=.1); c.add_argument('--sensor')
-    c=sub.add_parser('trial',parents=[progress_options]); c.set_defaults(func=trial)
+    c=sub.add_parser('trial',parents=[progress_options,status_options]); c.set_defaults(func=trial)
     c.add_argument('--comp-model',choices=['comp','gru'],default='comp',help='compression predictor; comp=ModernTCN')
     c.add_argument('--record-power',action='store_true',help='record main-module VDD_IN from read-only INA3221 sysfs')
     c.add_argument('--power-interval',type=float,default=.1,help='sensor polling interval, not conversion bandwidth')

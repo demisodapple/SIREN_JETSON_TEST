@@ -153,6 +153,35 @@ class TestCompression(unittest.TestCase):
 
 
 class TestProgress(unittest.TestCase):
+    def test_wrapper_status_visible_with_quiet_model_progress(self):
+        args=run.parser().parse_args(['trial','--no-progress','--output','unused'])
+        self.assertTrue(args.no_progress)
+        self.assertFalse(args.quiet_status)
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status=run.OverallStatus('REPEAT 1/3')
+            status.preparing([('pd',True),('bus',True),('comp',False)],True)
+            status.measuring(time.monotonic()-30,60,[('pd',None),('bus',None),('comp',None)],True)
+        self.assertIn('2/3 ready',out.getvalue())
+        self.assertIn('COMP=LOADING/WARMUP',out.getvalue())
+        self.assertIn('MEASURING [',out.getvalue())
+        self.assertNotIn('100%',out.getvalue())
+
+    def test_wrapper_waits_for_actual_completion_and_quiet_status_suppresses_it(self):
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status=run.OverallStatus()
+            status.measuring(time.monotonic()-10,1,[('pd',None)],True)
+        self.assertIn('99%',out.getvalue())
+        self.assertIn('waiting for current inferences',out.getvalue())
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status=run.OverallStatus(enabled=False)
+            status.preparing([('pd',True)],True); status.complete()
+        self.assertEqual(out.getvalue(),'')
+        with self.assertRaises(ValueError): run.OverallStatus(interval=0)
+        with self.assertRaises(ValueError): run.OverallStatus(interval=float('nan'))
+
     def test_elapsed_bar_does_not_claim_inference_finished(self):
         p=run.Progress('PD',enabled=False)
         p.stage('measure',target=.01); p.state=('measure',time.monotonic()-1,.01,None)
