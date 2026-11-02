@@ -6,6 +6,11 @@ from pathlib import Path
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
+import contextlib
+import io
+import signal
+import time
 
 import numpy as np
 import torch
@@ -22,6 +27,12 @@ TEST_TMP.mkdir(exist_ok=True)
 
 
 class TestModels(unittest.TestCase):
+    def test_float_operations_never_run_inference(self):
+        expected={'pd':7537850880,'comp':4613276160}
+        for name in ('pd','comp'):
+            m=models.Model(name,backend='float')
+            with mock.patch.object(m,'forward',side_effect=AssertionError('OPS must not run inference')):
+                self.assertEqual(m.operations()['operations_per_frame'],expected[name])
     def test_hash_and_metadata(self):
         for name in models.FILES:
             bundle,digest=models.load_bundle(name)
@@ -138,6 +149,31 @@ class TestCompression(unittest.TestCase):
         aux=np.zeros((len(q),6),np.float32)
         packet,_=codec.encode(q,aux,p,2,5)
         np.testing.assert_array_equal(codec.decode(packet,p)[0],q)
+
+
+class TestProgress(unittest.TestCase):
+    def test_elapsed_bar_does_not_claim_inference_finished(self):
+        p=run.Progress('PD',enabled=False)
+        p.stage('measure',target=.01); p.state=('measure',time.monotonic()-1,.01,None)
+        p.advance(0)
+        text=p.render()
+        self.assertIn('99%',text)
+        self.assertIn('completed inferences 0',text)
+        self.assertIn('waiting for current inference',text)
+
+    def test_unknown_stage_has_heartbeat_and_quiet_mode_is_silent(self):
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with run.Progress('PD',interval=.01) as p:
+                p.stage('weights')
+                time.sleep(.04)
+        self.assertIn('waiting for stage to finish',out.getvalue())
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with run.Progress('PD',enabled=False) as p: p.stage('weights')
+        self.assertEqual(out.getvalue(),'')
+        self.assertIn('SIGILL',run.failure_status(-signal.SIGILL))
+        self.assertIn('exit code 2',run.failure_status(2))
 
 
 class TestPreparationAndPower(unittest.TestCase):

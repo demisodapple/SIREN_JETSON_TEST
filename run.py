@@ -11,8 +11,86 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
+import signal
 
 ROOT = Path(__file__).resolve().parent
+
+
+class Progress:
+    """Low-rate line progress, also visible over SSH and captured in log files.
+
+    A heartbeat can show elapsed time during one long native call. It cannot
+    know that call's completion percentage. Disable for final timing comparisons.
+    """
+    def __init__(self, label, enabled=True, interval=2.):
+        if interval<=0: raise ValueError('--progress-interval must be positive')
+        self.label,self.enabled,self.interval=label,enabled,interval
+        self.stop=threading.Event(); self.thread=None
+        self.state=('starting',time.monotonic(),None,None)
+        self.completed=0
+
+    def __enter__(self):
+        if self.enabled:
+            self.thread=threading.Thread(target=self._run,daemon=True)
+            self.thread.start()
+        return self
+
+    def stage(self, name, target=None, total=None):
+        self.completed=0
+        self.state=(name,time.monotonic(),target,total)
+        if self.enabled: print('[%s] %s ...'%(self.label,name),flush=True)
+
+    def advance(self,count):
+        self.completed=count
+
+    def render(self):
+        name,start,target,total=self.state
+        elapsed=time.monotonic()-start
+        if target is not None:
+            fraction=min(.99,elapsed/target)
+            n=int(fraction*20)
+            detail='[%s%s] %2d%% time %.1f/%.1fs | completed inferences %d'%(
+                '#'*n,'-'*(20-n),fraction*100,elapsed,target,self.completed)
+            if elapsed>=target: detail+=' | waiting for current inference to finish'
+        elif total is not None:
+            fraction=min(1.,self.completed/max(total,1))
+            n=int(fraction*20)
+            detail='[%s%s] %d/%d | %.1fs'%('#'*n,'-'*(20-n),self.completed,total,elapsed)
+        else:
+            detail='elapsed %.1fs; waiting for stage to finish'%elapsed
+        return '[%s] %s | %s'%(self.label,name,detail)
+
+    def _run(self):
+        while not self.stop.wait(self.interval):
+            print(self.render(),flush=True)
+
+    def __exit__(self,*exc):
+        self.stop.set()
+        if self.thread: self.thread.join(timeout=self.interval+1)
+
+
+def failure_status(code):
+    if code<0:
+        try: return 'signal %s (%d)'%(signal.Signals(-code).name,-code)
+        except ValueError: return 'signal %d'%(-code)
+    return 'exit code %d'%code
+
+
+def progress_flags(args):
+    flags=['--progress-interval',str(getattr(args,'progress_interval',2.))]
+    if getattr(args,'no_progress',False): flags.append('--no-progress')
+    return flags
+
+
+def drain_logs(folder,names,offsets):
+    """Mirror new worker lines while retaining the original per-model logs."""
+    for name in names:
+        path=folder/(name+'.log')
+        if path.exists():
+            with open(str(path),'r',encoding='utf-8',errors='replace') as f:
+                f.seek(offsets.get(name,0)); text=f.read(); offsets[name]=f.tell()
+            if text: print(text,end='',flush=True)
 
 
 def write_json(path, data):
@@ -52,7 +130,8 @@ def check(args):
     print(json.dumps(info,ensure_ascii=False,indent=2))
 
 
-def setup_model(args):
+def setup_model(args,progress=None):
+    if progress: progress.stage('1/6 Import PyTorch and model code')
     import torch
     from models import Model
     if args.threads < 1:
@@ -65,6 +144,7 @@ def setup_model(args):
         torch.backends.cudnn.deterministic=True
     if hasattr(torch.backends,'cuda') and hasattr(torch.backends.cuda,'matmul'):
         torch.backends.cuda.matmul.allow_tf32=False
+    if progress: progress.stage('2/6 Load weights and construct model on '+args.device)
     return Model(args.model,args.device,args.backend)
 
 
@@ -147,22 +227,32 @@ def gate(args):
 
 
 def benchmark(args):
+    with Progress(args.model.upper(),not getattr(args,'no_progress',False),
+                  getattr(args,'progress_interval',2.)) as progress:
+        _benchmark(args,progress)
+
+
+def _benchmark(args,progress):
+    progress.stage('Import numerical libraries')
     import numpy as np
     import torch
     from preprocess import load_input
     from models import file_sha
     if args.duration<=0 or args.repeat<1 or args.warmup<0:
         raise ValueError('duration/repeat must be positive, warmup nonnegative')
-    m=setup_model(args)
+    m=setup_model(args,progress)
+    progress.stage('3/6 Load input and transfer to '+args.device)
     x,meta,expected=load_input(args.input,m)
     if meta['calibration_mode']=='arbitrary_demo':
         print('DEMO CALIBRATION: DNN load/power experiment only; detection accuracy is unvalidated.',flush=True)
     if meta['synthetic']:
         print('SYNTHETIC INPUT: DNN load/OPS experiment; task accuracy and representative mission power unvalidated.',flush=True)
+    progress.stage('4/6 Count operations from model structure (no GPU forward)')
     ops=m.operations()
     # Validate supplied reference outside measurement, preserving sequential GRU states.
     validation={'expected_provided':expected is not None,'passed':None}
     if expected is not None:
+        progress.stage('Validate supplied reference outputs',total=len(x))
         if len(expected)!=len(x): raise ValueError('expected output length mismatch')
         m.reset()
         for i in range(len(x)):
@@ -170,9 +260,13 @@ def benchmark(args):
             target=expected[i:i+1]
             if m.backend=='reference': np.testing.assert_array_equal(got,target)
             else: np.testing.assert_allclose(got,target,rtol=1e-5,atol=1e-6)
+            progress.advance(i+1)
         validation['passed']=True
-    for _ in range(args.warmup):
+    progress.stage('5/6 Warmup (first inference may take longer)',total=args.warmup)
+    for index in range(args.warmup):
         m.reset(); m.forward(x[:1]); m.synchronize()
+        progress.advance(index+1)
+    if args.gate: progress.stage('Ready; waiting for other models')
     gate(args)
     result={'schema':1,'kind':'dnn','model':m.name,'backend':m.backend,'implementation':m.description,
             'device':str(m.device),'threads':args.threads,'torch':torch.__version__,'python':sys.version,
@@ -180,11 +274,15 @@ def benchmark(args):
             'input_shape':list(x.shape),'input':meta,'validation':validation,'operations':ops,
             'scope':'preloaded-device tensor to DNN output; model load/preprocessing/transfers excluded',
             'power_scope':'board input during inference loop; includes synchronization and loop bookkeeping',
-            'cuda_memory_peak_bytes':None,'runs':[]}
+            'cuda_memory_peak_bytes':None,'runs':[],
+            'progress':{'enabled':not getattr(args,'no_progress',False),
+                        'interval_seconds':getattr(args,'progress_interval',2.),
+                        'note':'low-rate heartbeat adds host/output activity; use --no-progress for final comparisons'}}
     if m.device.type=='cuda': torch.cuda.reset_peak_memory_stats()
     with telemetry(args.tegrastats):
         for repeat in range(args.repeat):
             m.reset(); m.synchronize()
+            progress.stage('6/6 Measure repeat %d/%d'%(repeat+1,args.repeat),target=args.duration)
             wall_start=time.time(); begin=time.perf_counter()
             measured=0.; frames=0; rows=0
             # Welford accumulators avoid unbounded latency arrays for long runs.
@@ -196,6 +294,7 @@ def benchmark(args):
                 out=m.forward(x[i:i+1]); m.synchronize()
                 elapsed=time.perf_counter()-a
                 measured+=elapsed; frames+=1; rows+=meta['valid_rows'][i]
+                progress.advance(frames)
                 delta=elapsed-mean; mean+=delta/frames; m2+=delta*(elapsed-mean)
                 lo=elapsed if lo is None else min(lo,elapsed); hi=max(hi,elapsed)
             end=time.perf_counter(); wall_end=time.time()
@@ -208,9 +307,14 @@ def benchmark(args):
                     'operations_per_second':ops['operations_per_frame']*frames/measured,
                     'gops':ops['operations_per_frame']*frames/measured/1e9}
             result['runs'].append(record)
+            if progress.enabled:
+                print('[%s] [####################] 100%% | repeat %d/%d complete | %d inferences'%(
+                    m.name.upper(),repeat+1,args.repeat,frames),flush=True)
             print(json.dumps(record),flush=True)
     if m.device.type=='cuda': result['cuda_memory_peak_bytes']=torch.cuda.max_memory_allocated()
+    progress.stage('Save result '+args.output)
     write_json(args.output,result)
+    if progress.enabled: print('[%s] DONE'%m.name.upper(),flush=True)
 
 
 def compress(args):
@@ -325,27 +429,42 @@ def together(args):
     folder=Path(args.output).resolve()
     folder.mkdir(parents=True,exist_ok=False)
     go=folder/'START'
-    children=[]; logs=[]
+    children=[]; logs=[]; offsets={}
     assignments=[('pd',args.pd_input),('bus',args.bus_input),(args.comp_model,args.comp_input)]
     try:
         for name,inp in assignments:
             log=open(str(folder/(name+'.log')),'x',encoding='utf-8'); logs.append(log)
-            cmd=[sys.executable,str(ROOT/'run.py'),'bench','--model',name,'--backend',args.backend,
+            cmd=[sys.executable,'-u','-X','faulthandler',str(ROOT/'run.py'),'bench','--model',name,'--backend',args.backend,
                  '--device',args.device,'--threads',str(args.threads),'--input',str(Path(inp).resolve()),
                  '--output',str(folder/(name+'.json')),'--duration',str(args.duration),'--repeat','1',
                  '--warmup',str(args.warmup),'--gate',str(go),'--ready',str(folder/(name+'.ready.json')),
-                 '--startup-timeout',str(args.startup_timeout)]
+                 '--startup-timeout',str(args.startup_timeout)]+progress_flags(args)
             children.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT))
         deadline=time.monotonic()+args.startup_timeout
+        last_display=0.
         while not all((folder/(name+'.ready.json')).exists() for name,_ in assignments):
-            if any(p.poll() is not None for p in children): raise RuntimeError('worker failed during startup; see model logs')
+            if not getattr(args,'no_progress',False) and time.monotonic()-last_display>=args.progress_interval:
+                drain_logs(folder,[n for n,_ in assignments],offsets); last_display=time.monotonic()
+            for (name,_),worker in zip(assignments,children):
+                if worker.poll() is not None:
+                    drain_logs(folder,[n for n,_ in assignments],offsets)
+                    raise RuntimeError('%s worker failed during startup: %s; see %s'%(name,failure_status(worker.returncode),folder/(name+'.log')))
             if time.monotonic()>deadline: raise TimeoutError('model loading/warmup timed out')
             time.sleep(.1)
         with telemetry(str(folder/'tegrastats.txt') if args.tegrastats else None):
             go.write_text('start',encoding='ascii')
             while any(p.poll() is None for p in children):
-                if any(p.poll() not in (None,0) for p in children): raise RuntimeError('worker failed; see model logs')
+                if not getattr(args,'no_progress',False) and time.monotonic()-last_display>=args.progress_interval:
+                    drain_logs(folder,[n for n,_ in assignments],offsets); last_display=time.monotonic()
+                for (name,_),worker in zip(assignments,children):
+                    if worker.poll() not in (None,0):
+                        drain_logs(folder,[n for n,_ in assignments],offsets)
+                        raise RuntimeError('%s worker failed: %s; see %s'%(name,failure_status(worker.returncode),folder/(name+'.log')))
                 time.sleep(.2)
+        if not getattr(args,'no_progress',False): drain_logs(folder,[n for n,_ in assignments],offsets)
+        for (name,_),worker in zip(assignments,children):
+            if worker.returncode!=0:
+                raise RuntimeError('%s worker failed: %s; see model log'%(name,failure_status(worker.returncode)))
         results=[json.loads((folder/(name+'.json')).read_text(encoding='utf-8')) for name,_ in assignments]
         starts=[r['runs'][0]['start_unix_s'] for r in results]
         ends=[r['runs'][0]['end_unix_s'] for r in results]
@@ -382,7 +501,7 @@ def trial(args):
         if file_sha(path)!=manifest['inputs'][name+'_'+args.backend]['sha256']:
             raise ValueError('bundled dummy input hash mismatch: '+str(path))
     common=['--backend',args.backend,'--device',args.device,'--threads',str(args.threads),
-            '--duration',str(args.duration),'--warmup',str(args.warmup)]
+            '--duration',str(args.duration),'--warmup',str(args.warmup)]+progress_flags(args)
     outputs=[]
     write_json(folder/'trial_config.json',{'models':['pd','bus','comp'],'synthetic':True,'backend':args.backend,
         'device':args.device,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
@@ -391,16 +510,21 @@ def trial(args):
     def child(extra,logname):
         with open(str(folder/logname),'x',encoding='utf-8') as log:
             print('Running: '+' '.join(extra),flush=True)
-            p=subprocess.Popen([sys.executable,'-u',str(ROOT/'run.py')]+extra,stdout=log,stderr=subprocess.STDOUT)
+            p=subprocess.Popen([sys.executable,'-u','-X','faulthandler',str(ROOT/'run.py')]+extra,
+                               stdout=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True,bufsize=1)
             try:
+                for line in p.stdout:
+                    log.write(line); log.flush()
+                    print(line,end='',flush=True)
                 status=p.wait()
             finally:
                 if p.poll() is None:
                     p.terminate()
                     try: p.wait(timeout=5)
                     except subprocess.TimeoutExpired: p.kill(); p.wait()
+                if p.stdout: p.stdout.close()
             if status!=0:
-                raise RuntimeError('trial worker failed; see '+str(folder/logname))
+                raise RuntimeError('trial worker failed: %s; see %s'%(failure_status(status),folder/logname))
     if args.phase in ('single','all'):
         for name in ('pd','bus','comp'):
             output=folder/(name+'.json')
@@ -436,6 +560,9 @@ def parser():
     common.add_argument('--device',choices=['cpu','cuda'],default='cpu')
     common.add_argument('--backend',choices=['reference','float'],default='reference')
     common.add_argument('--threads',type=int,default=1,help='CPU threads per process, not CPU power-off')
+    progress_options=argparse.ArgumentParser(add_help=False)
+    progress_options.add_argument('--no-progress',action='store_true',help='disable heartbeat/progress output for final measurements')
+    progress_options.add_argument('--progress-interval',type=float,default=2.,help='progress heartbeat interval in seconds')
     c=sub.add_parser('check'); c.add_argument('--output',default='results/environment.json'); c.set_defaults(func=check)
     c=sub.add_parser('ops',parents=[common]); c.set_defaults(func=operations_command)
     c.add_argument('--output',required=True)
@@ -449,7 +576,7 @@ def parser():
     c.add_argument('--demo-calibration',help='explicit arbitrary demo JSON for PD/BUS load tests')
     c.add_argument('--bus-channel',help='select EIRSAT Channel; demo defaults to 15 when column exists')
     for flag in ('tables','state','date','context','records','geo','sun'): c.add_argument('--'+flag)
-    c=sub.add_parser('bench',parents=[common]); c.set_defaults(func=benchmark)
+    c=sub.add_parser('bench',parents=[common,progress_options]); c.set_defaults(func=benchmark)
     c.add_argument('--input',required=True); c.add_argument('--output',required=True)
     c.add_argument('--duration',type=float,default=60); c.add_argument('--repeat',type=int,default=3)
     c.add_argument('--warmup',type=int,default=3); c.add_argument('--tegrastats')
@@ -462,7 +589,7 @@ def parser():
     c.add_argument('--limit',type=int); c.add_argument('--tegrastats')
     c=sub.add_parser('decode',parents=[common]); c.set_defaults(func=decode_command)
     c.add_argument('--input',required=True); c.add_argument('--output',required=True)
-    c=sub.add_parser('together'); c.set_defaults(func=together)
+    c=sub.add_parser('together',parents=[progress_options]); c.set_defaults(func=together)
     for name in ('pd','bus','comp'): c.add_argument('--'+name+'-input',required=True)
     c.add_argument('--comp-model',choices=['comp','gru'],default='comp')
     c.add_argument('--backend',choices=['reference','float'],default='reference')
@@ -474,7 +601,7 @@ def parser():
     c.add_argument('--input',required=True,help='external power CSV, Unix epoch time_s and power_w')
     c.add_argument('--result',required=True); c.add_argument('--output',required=True)
     c.add_argument('--max-gap',type=float,default=.05)
-    c=sub.add_parser('trial'); c.set_defaults(func=trial)
+    c=sub.add_parser('trial',parents=[progress_options]); c.set_defaults(func=trial)
     c.add_argument('--backend',choices=['reference','float'],default='float')
     c.add_argument('--device',choices=['cpu','cuda'],default='cpu')
     c.add_argument('--phase',choices=['single','together','all'],default='all')
@@ -486,6 +613,8 @@ def parser():
 
 
 if __name__=='__main__':
+    import faulthandler
+    faulthandler.enable()
     args=parser().parse_args()
     try:
         if hasattr(args,'output') and args.command not in ('together','trial') and Path(args.output).exists():

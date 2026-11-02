@@ -2,6 +2,37 @@
 
 Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 측정 → GRU와 ModernTCN 압축 비교 → 전력 로그 결합**을 진행한다. 모든 명령은 `run.py`에서 실행한다.
 
+**진행 표시와 첫 실행 진단**
+
+`bench`, `trial`, `together`는 기본으로 진행 상황을 표시한다. 추가 패키지가 필요하지 않다. SSH에서도 보이며 trial은 하위 프로세스 출력을 실시간으로 터미널과 모델별 로그에 함께 남긴다.
+
+```text
+[PD] 1/6 Import PyTorch and model code ...
+[PD] 2/6 Load weights and construct model on cuda ...
+[PD] 3/6 Load input and transfer to cuda ...
+[PD] 4/6 Count operations from model structure (no GPU forward) ...
+[PD] 5/6 Warmup (first inference may take longer) ...
+[PD] 5/6 Warmup ... | [--------------------] 0/1 | 8.0s
+[PD] 6/6 Measure repeat 1/3 | [#####---------------] 25% time 15.0/60.0s | completed inferences 8
+```
+
+로딩·예비 실행은 실제 내부 완료율을 알 수 없어 경과 시간과 완료 횟수를 표시한다. 측정 막대는 목표 시간 대비 경과율이며, 오래 걸리는 추론이 끝나지 않았으면 99%에서 완료를 기다린다고 표시한다. 완료 메시지 전에는 성공으로 판단하지 않는다. `--duration 1`은 모델 로딩·첫 CUDA 계산까지 1초 안에 완료한다는 뜻이 아니다.
+
+표시는 기본 2초 간격이며 `--progress-interval 5`로 늦추거나, 정식 성능·전력 비교에서 `--no-progress`로 끌 수 있다. 출력·백그라운드 표시 스레드도 호스트 부하를 만들므로 비교 조건마다 동일하게 설정한다. 표시 여부와 간격은 DNN 결과 JSON에 기록된다. 기존 반복별 JSON 출력은 유지한다.
+
+이전의 연산량 계산은 첫 추론을 실행했지만 이제 FP32 PD/Comp 연산량을 구조에서 직접 계산한다. GPU 추론은 명시적인 예비 실행/측정 단계에서 수행한다. 오류 시 Python traceback 또는 가능한 네이티브 fault 정보를 남기고, 하위 프로세스의 종료 코드·SIGKILL/SIGILL 같은 종료 신호를 표시한다. 신호 이름만으로 근본 원인을 확정하지 않으며, 예를 들어 SIGKILL이면 시스템 메모리 부족 로그 등을 추가 확인한다.
+
+JetPack 4/Python 3.6 환경에서 NumPy 1.19.5 import가 `Illegal instruction`으로 중단되면 NVIDIA가 안내한 OpenBLAS 설정을 먼저 적용한다. [NVIDIA 관련 안내](https://forums.developer.nvidia.com/t/cupy-crashes-on-jetson-nano/169103)
+
+```bash
+cd ~/SIREN_JETSON_TEST
+source .venv/bin/activate
+export OPENBLAS_CORETYPE=ARMV8
+python3 run.py trial --device cuda --phase single --duration 1 --repeat 1 --warmup 1 --output results/gpu_progress01
+```
+
+이 설정은 현재 SSH 세션과 자식 프로세스에 적용된다. 진행 중인 작업을 중복 실행하지 않는다. 재시험할 때 결과 폴더 이름을 바꾼다. GUI 웹 대시보드는 추가하지 않고 터미널에서 단계와 진행 상태를 확인하도록 구성했다.
+
 **원자료 없이 세 DNN 실행과 OPS 측정하기**
 
 `dummy_data/`에 PD·BUS·압축용 ModernTCN 입력을 포함했다. 원자료 다운로드나 전처리 없이 바로 실행한다. 임무는 세 개이며 GRU는 3번 임무의 추가 비교용이다. 기본 `trial`의 세 모델은 PD + BUS + ModernTCN이다.

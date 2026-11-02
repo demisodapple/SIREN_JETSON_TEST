@@ -432,23 +432,16 @@ class Model:
                     macs += layer['output_shape'][0] * k * cin * cout
             excluded = 'bias, residual add, LayerNorm, GELU, requantization, emulation overhead'
         else:
-            total = [0]
-            handles = []
-            def hook(module, args, output):
-                total[0] += output.numel() * (module.in_channels // module.groups) * module.kernel_size[0]
             if self.name == 'bus':
                 macs = sum(l['output_shape'][0] * int(np.prod(l['weights'].shape))
                            for l in self.contract['layers'] if l['kind'] in ic.MAC_KINDS)
             else:
-                for module in self.network.modules():
-                    if isinstance(module, nn.Conv1d):
-                        handles.append(module.register_forward_hook(hook))
-                try:
-                    self.forward(self.tensor(np.zeros([1]+self.input_shape, np.float32)))
-                    macs = total[0]
-                finally:
-                    for handle in handles:
-                        handle.remove()
+                # All PD/Comp convolutions retain the input time length: causal
+                # kernels are left-padded, pointwise kernels have stride 1.
+                # Count statically rather than invoking a hidden first GPU forward.
+                macs = self.input_shape[0] * sum(
+                    module.out_channels * (module.in_channels // module.groups) * module.kernel_size[0]
+                    for module in self.network.modules() if isinstance(module, nn.Conv1d))
             excluded = 'bias, residual add, LayerNorm, GELU, preprocessing'
         return {'macs_per_frame': int(macs), 'operations_per_frame': int(2*macs),
                 'convention': '1 MAC = 2 operations; matrix/conv only', 'excluded': excluded}
