@@ -1,5 +1,7 @@
 # SIREN JETSON TEST
 
+GPU 첫 추론에서 종료되면 [GPU 재진단 절차](GPU_RETRY.md)를 따른다. `gpu_probe.py`가 단계·층별 메모리 로그를 남기며, `--cudnn-mode off`도 GPU CUDA 실행이다. 실제 보드 성공 여부는 진단 결과로 확인한다.
+
 Jetson Nano에서 **PD·BUS·압축 예측기 실행 → DNN 연산량·시간 측정 → GRU와 ModernTCN 압축 비교 → 전력 로그 결합**을 진행한다. 모든 명령은 `run.py`에서 실행한다.
 
 **전력 측정 중 전체 진행바**

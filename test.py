@@ -27,6 +27,26 @@ TEST_TMP=Path(__file__).resolve().parent/'results'
 TEST_TMP.mkdir(exist_ok=True)
 
 
+class TestGPUOptions(unittest.TestCase):
+    def test_modes_and_wrappers(self):
+        for mode in ('deterministic', 'heuristic', 'off'):
+            args=run.parser().parse_args(['trial','--output','unused','--cudnn-mode',mode])
+            self.assertEqual(run.cudnn_flags(args), ['--cudnn-mode',mode])
+            args=run.parser().parse_args(['together','--output','unused','--pd-input','p',
+                '--bus-input','b','--comp-input','c','--cudnn-mode',mode])
+            self.assertEqual(args.cudnn_mode, mode)
+            backend=SimpleNamespace(enabled=True,benchmark=True,deterministic=True,allow_tf32=True)
+            fake=SimpleNamespace(backends=SimpleNamespace(cudnn=backend))
+            run.configure_cudnn(fake,mode)
+            self.assertEqual(backend.enabled,mode!='off')
+            self.assertEqual(backend.deterministic,mode=='deterministic')
+            self.assertFalse(backend.benchmark)
+            self.assertFalse(backend.allow_tf32)
+    def test_invalid_mode(self):
+        with self.assertRaises(ValueError):
+            run.configure_cudnn(None,'invalid')
+
+
 class TestModels(unittest.TestCase):
     def test_float_operations_never_run_inference(self):
         expected={'pd':7537850880,'comp':4613276160}

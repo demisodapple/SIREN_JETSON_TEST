@@ -174,6 +174,20 @@ def check(args):
     print(json.dumps(info,ensure_ascii=False,indent=2))
 
 
+def configure_cudnn(torch, mode):
+    if mode not in ('deterministic', 'heuristic', 'off'):
+        raise ValueError('invalid cuDNN mode')
+    torch.backends.cudnn.enabled = mode != 'off'
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = mode == 'deterministic'
+    if hasattr(torch.backends.cudnn, 'allow_tf32'):
+        torch.backends.cudnn.allow_tf32 = False
+
+
+def cudnn_flags(args):
+    return ['--cudnn-mode', getattr(args, 'cudnn_mode', 'deterministic')]
+
+
 def setup_model(args,progress=None):
     if progress: progress.stage('1/6 Import PyTorch and model code')
     import torch
@@ -183,9 +197,7 @@ def setup_model(args,progress=None):
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
     torch.manual_seed(0)
-    if hasattr(torch.backends,'cudnn'):
-        torch.backends.cudnn.benchmark=False
-        torch.backends.cudnn.deterministic=True
+    configure_cudnn(torch, getattr(args, 'cudnn_mode', 'deterministic'))
     if hasattr(torch.backends,'cuda') and hasattr(torch.backends.cuda,'matmul'):
         torch.backends.cuda.matmul.allow_tf32=False
     if progress: progress.stage('2/6 Load weights and construct model on '+args.device)
@@ -313,12 +325,12 @@ def _benchmark(args,progress):
     if args.gate: progress.stage('Ready; waiting for other models')
     gate(args)
     result={'schema':1,'kind':'dnn','model':m.name,'backend':m.backend,'implementation':m.description,
-            'device':str(m.device),'threads':args.threads,'torch':torch.__version__,'python':sys.version,
+            'device':str(m.device),'cudnn_mode':getattr(args,'cudnn_mode','deterministic'),'threads':args.threads,'torch':torch.__version__,'python':sys.version,
             'machine':platform.machine(),'weight_sha256':m.sha,'input_sha256':file_sha(args.input),
             'input_shape':list(x.shape),'input':meta,'validation':validation,'operations':ops,
             'scope':'preloaded-device tensor to DNN output; model load/preprocessing/transfers excluded',
             'power_scope':'board input during inference loop; includes synchronization and loop bookkeeping',
-            'cuda_memory_peak_bytes':None,'runs':[],
+            'cuda_memory_peak_bytes':None,'cuda_memory_peak_reserved_bytes':None,'runs':[],
             'progress':{'enabled':not getattr(args,'no_progress',False),
                         'interval_seconds':getattr(args,'progress_interval',2.),
                         'note':'low-rate heartbeat adds host/output activity; use --no-progress for final comparisons'}}
@@ -355,7 +367,9 @@ def _benchmark(args,progress):
                 print('[%s] [####################] 100%% | repeat %d/%d complete | %d inferences'%(
                     m.name.upper(),repeat+1,args.repeat,frames),flush=True)
             print(json.dumps(record),flush=True)
-    if m.device.type=='cuda': result['cuda_memory_peak_bytes']=torch.cuda.max_memory_allocated()
+    if m.device.type=='cuda':
+        result['cuda_memory_peak_bytes']=torch.cuda.max_memory_allocated()
+        result['cuda_memory_peak_reserved_bytes']=torch.cuda.max_memory_reserved()
     progress.stage('Save result '+args.output)
     write_json(args.output,result)
     if progress.enabled: print('[%s] DONE'%m.name.upper(),flush=True)
@@ -458,7 +472,7 @@ def together(args):
                  '--device',args.device,'--threads',str(args.threads),'--input',str(Path(inp).resolve()),
                  '--output',str(folder/(name+'.json')),'--duration',str(args.duration),'--repeat','1',
                  '--warmup',str(args.warmup),'--gate',str(go),'--ready',str(folder/(name+'.ready.json')),
-                 '--startup-timeout',str(args.startup_timeout)]+progress_flags(args)
+                 '--startup-timeout',str(args.startup_timeout)]+progress_flags(args)+cudnn_flags(args)
             children.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT))
         deadline=time.monotonic()+args.startup_timeout
         last_display=0.
@@ -571,10 +585,10 @@ def _trial(args,folder_created=False):
         if file_sha(path)!=manifest['inputs'][name+'_'+args.backend]['sha256']:
             raise ValueError('bundled dummy input hash mismatch: '+str(path))
     common=['--backend',args.backend,'--device',args.device,'--threads',str(args.threads),
-            '--duration',str(args.duration),'--warmup',str(args.warmup)]+progress_flags(args)
+            '--duration',str(args.duration),'--warmup',str(args.warmup)]+progress_flags(args)+cudnn_flags(args)
     outputs=[]
     write_json(folder/'trial_config.json',{'models':list(model_names),'synthetic':True,'backend':args.backend,
-        'device':args.device,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
+        'device':args.device,'cudnn_mode':args.cudnn_mode,'phase':args.phase,'repeat':args.repeat,'duration_seconds':args.duration,
         'scope':'DNN only; preprocessing, compression and model loading excluded',
         'power_note':'module INA3221 log enabled' if args.record_power else 'no power capture; supply external CSV or --record-power',
         'status_output':{'enabled':not args.quiet_status,'interval_seconds':args.status_interval}})
@@ -630,6 +644,7 @@ def parser():
     common=argparse.ArgumentParser(add_help=False)
     common.add_argument('--model',choices=['pd','bus','comp','gru'],required=True)
     common.add_argument('--device',choices=['cpu','cuda'],default='cpu')
+    common.add_argument('--cudnn-mode',choices=['deterministic','heuristic','off'],default='deterministic')
     common.add_argument('--backend',choices=['reference','float'],default='reference')
     common.add_argument('--threads',type=int,default=1,help='CPU threads per process, not CPU power-off')
     progress_options=argparse.ArgumentParser(add_help=False)
@@ -665,6 +680,7 @@ def parser():
     c=sub.add_parser('decode',parents=[common]); c.set_defaults(func=decode_command)
     c.add_argument('--input',required=True); c.add_argument('--output',required=True)
     c=sub.add_parser('together',parents=[progress_options,status_options]); c.set_defaults(func=together)
+    c.add_argument('--cudnn-mode',choices=['deterministic','heuristic','off'],default='deterministic')
     c.add_argument('--status-label',help=argparse.SUPPRESS)
     for name in ('pd','bus','comp'): c.add_argument('--'+name+'-input',required=True)
     c.add_argument('--comp-model',choices=['comp','gru'],default='comp')
@@ -683,6 +699,7 @@ def parser():
     c.add_argument('--output',required=True); c.add_argument('--duration',type=float,default=30.)
     c.add_argument('--interval',type=float,default=.1); c.add_argument('--sensor')
     c=sub.add_parser('trial',parents=[progress_options,status_options]); c.set_defaults(func=trial)
+    c.add_argument('--cudnn-mode',choices=['deterministic','heuristic','off'],default='deterministic')
     c.add_argument('--comp-model',choices=['comp','gru'],default='comp',help='compression predictor; comp=ModernTCN')
     c.add_argument('--record-power',action='store_true',help='record main-module VDD_IN from read-only INA3221 sysfs')
     c.add_argument('--power-interval',type=float,default=.1,help='sensor polling interval, not conversion bandwidth')
