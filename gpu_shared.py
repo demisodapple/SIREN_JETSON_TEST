@@ -22,6 +22,7 @@ from power import PowerRecorder, attach_recorded_power
 def add_parser(sub):
     p=sub.add_parser('gpu-shared',help='FP32, shared CUDA context, three model streams')
     p.add_argument('--comp-model',choices=['comp','gru'],default='comp')
+    p.add_argument('--only',choices=['pd','bus','comp','gru'],help='one model using the same worker/timing implementation')
     p.add_argument('--duration',type=float,default=60.)
     p.add_argument('--repeat',type=int,default=3)
     p.add_argument('--warmup',type=int,default=3)
@@ -117,7 +118,7 @@ def run(args):
     if not math.isfinite(args.startup_timeout) or args.startup_timeout<=0:
         raise ValueError('startup timeout must be positive')
     folder=Path(args.output).resolve(); folder.mkdir(parents=True,exist_ok=False)
-    names=['pd','bus',args.comp_model]
+    names=[args.only] if args.only else ['pd','bus',args.comp_model]
     manifest=json.loads((ROOT/'dummy_data'/'manifest.json').read_text(encoding='utf-8'))
     inputs={n:ROOT/manifest['inputs'][n+'_float']['file'] for n in names}
     for name,path in inputs.items():
@@ -125,7 +126,7 @@ def run(args):
             raise ValueError('bundled dummy input hash mismatch: '+str(path))
     write_json(folder/'config.json',dict(arguments={k:v for k,v in vars(args).items() if k!='func'},models=names,
         source_sha256={n:file_sha_light(ROOT/n) for n in ('gpu_shared.py','models.py','preprocess.py','power.py')}))
-    print('[SHARED] Import PyTorch; one process / three streams / FP32 / cuDNN off',flush=True)
+    print('[SHARED] Import PyTorch; one process / %d streams / FP32 / cuDNN off'%len(names),flush=True)
     import torch
     torch.set_num_threads(1); torch.set_num_interop_threads(1); torch.manual_seed(0)
     configure_cudnn(torch,'off')
@@ -133,8 +134,8 @@ def run(args):
         torch.backends.cuda.matmul.allow_tf32=False
     if not torch.cuda.is_available(): raise ValueError('CUDA unavailable')
     outbox=queue.Queue(); inboxes={}; threads=[]; infos={}
-    gate=threading.Barrier(4)
-    finished=threading.Barrier(3)
+    gate=threading.Barrier(len(names)+1)
+    finished=threading.Barrier(len(names))
     recorder=PowerRecorder(folder/'power.csv',args.power_interval) if args.record_power else None
     def receive(timeout):
         item=outbox.get(timeout=timeout)
@@ -157,7 +158,7 @@ def run(args):
                         elapsed=time.monotonic()-started
                         print('[SHARED] Loading/warmup %s | %.0fs'%(name.upper(),elapsed),flush=True)
                         if elapsed>args.startup_timeout: raise TimeoutError('startup '+name)
-                print('[SHARED] READY %s (%d/3)'%(name.upper(),len(infos)),flush=True)
+                print('[SHARED] READY %s (%d/%d)'%(name.upper(),len(infos),len(names)),flush=True)
             torch.cuda.synchronize(); torch.cuda.empty_cache()
             for repeat in range(1,args.repeat+1):
                 torch.cuda.reset_peak_memory_stats()
@@ -165,14 +166,14 @@ def run(args):
                 for name in names: inboxes[name].put(repeat)
                 gate.wait(timeout=args.startup_timeout)
                 started=time.monotonic(); records={}
-                while len(records)<3:
+                while len(records)<len(names):
                     try:
                         kind,name,record=receive(5.)
                         if kind!='result' or name in records: raise RuntimeError('unexpected worker result')
                         records[name]=record
                     except queue.Empty:
                         elapsed=time.monotonic()-started
-                        print('[SHARED %d/%d] %.1f/%.1fs | %d/3 finished'%(repeat,args.repeat,elapsed,args.duration,len(records)),flush=True)
+                        print('[SHARED %d/%d] %.1f/%.1fs | %d/%d finished'%(repeat,args.repeat,elapsed,args.duration,len(records),len(names)),flush=True)
                         if elapsed>args.duration+args.startup_timeout: raise TimeoutError('inference timeout')
                 for name in names:
                     info=dict(infos[name]); info['runs']=[records[name]]
@@ -182,9 +183,9 @@ def run(args):
                 union_start=min(r['start_unix_s'] for r in records.values())
                 union_end=max(r['end_unix_s'] for r in records.values())
                 system=dict(schema=1,kind='concurrent_dnn',device='cuda',backend='float',models=names,
-                    execution='single process; three persistent worker threads and dedicated CUDA streams',
+                    execution='single process; %d persistent worker threads and dedicated CUDA streams'%len(names),
                     cudnn_mode='off',start_unix_s=start,end_unix_s=end,
-                    scope='intersection of three DNN inference loops; sampled module power, not per-model power',
+                    scope='intersection of active DNN inference loops; sampled module power, not isolated DNN electrical power',
                     cuda_memory_peak_bytes=torch.cuda.max_memory_allocated(),
                     cuda_memory_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
                     union_start_unix_s=union_start,union_end_unix_s=union_end,

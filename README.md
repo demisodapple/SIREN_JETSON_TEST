@@ -13,6 +13,8 @@ python3 -u run.py gpu-shared --comp-model comp --duration 60 --repeat 3 --warmup
 
 GRU 구성은 `--comp-model gru` 및 새로운 결과 폴더를 사용한다. FP32·cuDNN off·배치 1을 사용하며 가중치와 더미 입력은 기존 trial과 동일하다. 3개 모델 준비 후 각 60초를 3회 측정한다. 입력 전처리·모델 로딩·예열은 측정 구간에서 제외한다.
 
+단독 비교는 같은 명령에 `--only pd`, `--only bus`, `--only comp` 중 하나를 추가한다. 선택한 모델만 로딩하며 동시 시험과 같은 추론·시간 측정 코드를 사용한다. 단독 결과도 `together_01/` 등의 폴더에 저장되므로 `system.json`의 `models` 목록으로 구분한다. 모든 조건에서 전력 모드를 동일하게 유지하고 기록한다. 기존 MAXN 시험에서 보드 전원 LED가 꺼져, 이후 비교 시험은 5W 모드(`sudo nvpmodel -m 1`)로 진행했다. 5W는 전력 모드 이름이며 센서 실측값의 상한을 보장하지 않는다.
+
 | 결과 | 의미 |
 |---|---|
 | `power.csv` | 준비부터 종료까지 모듈 입력 전력 원본, 기본 약 10 Hz |
